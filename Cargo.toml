@@ -1,0 +1,17 @@
+[package]
+name = "unipkg"
+version = "0.1.0"
+edition = "2021"
+description = "A universal store based package manager written in Rust"
+
+[dependencies]
+ar = "0.9"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lzma-rs = "0.3"
+ruzstd = "0.9"
+tar = "0.4"
+ureq = "3"
+
+[dev-dependencies]
+zstd = "0.13"
+
