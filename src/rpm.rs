@@ -60,7 +60,7 @@ pub fn install(store: &Store, rpm: &[u8]) -> io::Result<(StorePath, RpmMeta)> {
         return Err(invalid("not an RPM file (bad magic)"));
     }
 
-    let mut pos = 96usize; // skip the 96-byte lead
+    let mut pos = 96usize;
 
     let sig_end = skip_header(rpm, pos)?;
     pos = align8(sig_end);
@@ -174,7 +174,7 @@ fn parse_header(data: &[u8], pos: usize) -> io::Result<(RpmMeta, usize)> {
     let mut requires: Vec<Vec<RpmDep>> = Vec::new();
     for (i, req_name) in req_names.iter().enumerate() {
         let flags = req_flags.get(i).copied().unwrap_or(0);
-        // Skip file dependencies, rpmlib pseudo-deps, and script-only deps.
+
         if flags & IGNORE_FLAGS != 0 || req_name.starts_with('/') || req_name.starts_with("(") {
             continue;
         }
@@ -262,7 +262,7 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
     loop {
         let mut hdr = [0u8; 110];
         match read_exact_or_eof(reader, &mut hdr)? {
-            0 => break, // EOF before any header byte — treat as end of archive
+            0 => break,
             110 => {}
             _ => return Err(invalid("truncated CPIO header")),
         }
@@ -352,7 +352,7 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
                 skip_pad(reader, filesize as usize % 4)?;
             }
         } else {
-            // Device node, FIFO, socket — skip.
+
             skip_bytes(reader, filesize)?;
             skip_pad(reader, filesize as usize % 4)?;
         }
@@ -378,7 +378,6 @@ pub fn write_meta(meta: &RpmMeta, sp: &StorePath) -> io::Result<()> {
     fs::write(dir.join("meta"), text)
 }
 
-/// Load persisted RPM metadata for a store path.
 #[allow(dead_code)]
 pub fn read_meta(sp: &StorePath) -> io::Result<RpmMeta> {
     let path = Store::state_dir()?.join(sp.to_string()).join("meta");
@@ -395,7 +394,7 @@ fn parse_meta(text: &str) -> RpmMeta {
                 "Package" => meta.package = v.trim().to_string(),
                 "Version" => {
                     meta.full_version = v.trim().to_string();
-                    // Strip epoch prefix for plain version.
+
                     let ver = v.trim();
                     meta.version = if let Some(pos) = ver.find(':') {
                         ver[pos + 1..].to_string()
@@ -413,7 +412,6 @@ fn parse_meta(text: &str) -> RpmMeta {
     meta
 }
 
-/// Render `Requires` into a comma-separated list for the meta file.
 pub fn render_requires(groups: &[Vec<RpmDep>]) -> String {
     groups
         .iter()
@@ -546,7 +544,6 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,7 +560,7 @@ mod tests {
     }
 
     fn write_cpio_entry(out: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) {
-        let namesize = name.len() + 1; // include NUL
+        let namesize = name.len() + 1;
         let filesize = data.len();
         let hdr = format!(
             "070701{ino:08X}{mode:08X}{uid:08X}{gid:08X}{nlink:08X}{mtime:08X}{filesize:08X}{devmajor:08X}{devminor:08X}{rdevmajor:08X}{rdevminor:08X}{namesize:08X}{check:08X}",
@@ -584,7 +581,7 @@ mod tests {
         assert_eq!(hdr.len(), 110);
         out.extend_from_slice(hdr.as_bytes());
         out.extend_from_slice(name.as_bytes());
-        out.push(0); // NUL
+        out.push(0);
         let after = 110 + namesize;
         let pad = (4 - after % 4) % 4;
         out.extend(std::iter::repeat(0u8).take(pad));
@@ -617,8 +614,8 @@ mod tests {
     fn build_rpm(meta: &RpmMeta, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
 
-        out.extend_from_slice(b"\xed\xab\xee\xdb"); // magic
-        out.extend_from_slice(&[0u8; 92]); // rest of lead
+        out.extend_from_slice(b"\xed\xab\xee\xdb");
+        out.extend_from_slice(&[0u8; 92]);
 
         out.extend_from_slice(&build_header_section(&[]));
         while out.len() % 8 != 0 {
@@ -642,7 +639,7 @@ mod tests {
         if !meta.description.is_empty() {
             tags.push((TAG_SUMMARY, 6, cstr(meta.description.as_bytes())));
         }
-        // Payload compressor tag (always present in real RPMs).
+
         tags.push((TAG_PAYLOADCOMPRESSOR, 6, cstr(b"gzip")));
         tags
     }
@@ -654,9 +651,9 @@ mod tests {
     }
 
     fn build_header_section(tags: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
-        // Compute data blob and index.
+
         let mut data: Vec<u8> = Vec::new();
-        let mut index: Vec<(u32, u32, u32, u32)> = Vec::new(); // tag, type, offset, count
+        let mut index: Vec<(u32, u32, u32, u32)> = Vec::new();
 
         for (tag, typ, bytes) in tags {
             let off = data.len() as u32;
@@ -668,9 +665,9 @@ mod tests {
         let hsize = data.len() as u32;
 
         let mut out = Vec::new();
-        // Magic (3 bytes) + reserved (1) + version (1) + reserved (3)
+
         out.extend_from_slice(b"\x8e\xad\xe8\x01");
-        out.extend_from_slice(&[0u8; 4]); // reserved
+        out.extend_from_slice(&[0u8; 4]);
         out.extend_from_slice(&nindex.to_be_bytes());
         out.extend_from_slice(&hsize.to_be_bytes());
 

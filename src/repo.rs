@@ -16,7 +16,6 @@ const DIST: &str = "stable";
 
 const DEFAULT_ARCHES: &[&str] = &["amd64", "i386"];
 
-/// The architecture of the host we are running on, in Debian terminology.
 pub fn host_arch() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -634,7 +633,6 @@ fn http_get(url: &str) -> io::Result<Vec<u8>> {
         Err(e) => Err(io::Error::other(format!("{url}: {e}"))),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -256,7 +256,7 @@ fn main() -> ExitCode {
             }
             let shown = results.len().min(100);
             for p in &results[..shown] {
-                // ANSI color codes for pretty output
+
                 const RESET: &str = "\x1b[0m";
                 const BOLD_CYAN: &str = "\x1b[1;36m";
                 const GREEN: &str = "\x1b[32m";
@@ -268,11 +268,11 @@ fn main() -> ExitCode {
                 } else {
                     format!(" - {}{}{}", DIM, p.description, RESET)
                 };
-                // Choose colors based on package kind (deb vs rpm)
+
                 let (pkg_color, ver_color) = if p.kind == "rpm" {
-                    (YELLOW, GREEN) // rpm packages highlighted with yellow name
+                    (YELLOW, GREEN)
                 } else {
-                    (BOLD_CYAN, GREEN) // deb packages retain previous colors
+                    (BOLD_CYAN, GREEN)
                 };
                 println!(
                     "{}{}{} {}{}{} [{}] {}{}{}{}",
@@ -649,7 +649,6 @@ fn install_rpm_package(name: &str) -> ExitCode {
         }
     }
 }
-
 
 fn find_installed<'a>(installed: &'a [resolve::Installed], name: &str) -> Option<&'a resolve::Installed> {
     let (pkg, arch) = match name.rsplit_once(':') {

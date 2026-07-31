@@ -5,7 +5,6 @@ use crate::deb::{self, DebMeta};
 use crate::elf;
 use crate::store::{Store, StorePath};
 
-/// Library directories that ship with the base system.
 const SYSTEM_LIB_DIRS: &[&str] = &[
     "/lib",
     "/usr/lib",
@@ -21,7 +20,6 @@ const SYSTEM_LIB_DIRS: &[&str] = &[
     "/usr/local/lib64",
 ];
 
-/// Library directories inside a Debian package, relative to the store root.
 const STORE_LIB_DIRS: &[&str] = &[
     "usr/lib/x86_64-linux-gnu",
     "usr/lib/i386-linux-gnu",

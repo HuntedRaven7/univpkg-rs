@@ -12,7 +12,7 @@ pub struct ElfInfo {
 
 impl ElfInfo {
     pub fn is_executable(&self) -> bool {
-        matches!(self.e_type, 2 | 3) // ET_EXEC | ET_DYN
+        matches!(self.e_type, 2 | 3)
     }
 }
 
@@ -20,8 +20,8 @@ pub fn read_elf(bytes: &[u8]) -> Option<ElfInfo> {
     if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
         return None;
     }
-    let class = bytes[4]; 
-    let le = bytes[5] == 1; 
+    let class = bytes[4];
+    let le = bytes[5] == 1;
     if !(class == 1 || class == 2) || (bytes[5] != 1 && bytes[5] != 2) {
         return None;
     }
@@ -43,7 +43,7 @@ pub fn read_elf(bytes: &[u8]) -> Option<ElfInfo> {
     };
 
     let mut interpreter = None;
-    let mut loads: Vec<(u64, u64, u64)> = Vec::new(); 
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
     let mut dynamic: Option<(u64, u64)> = None;
 
     for i in 0..phnum {
@@ -86,9 +86,9 @@ pub fn read_elf(bytes: &[u8]) -> Option<ElfInfo> {
                 ),
             };
             match tag {
-                0 => break, 
-                1 => needed_offsets.push(val), 
-                5 => strtab_vaddr = Some(val), 
+                0 => break,
+                1 => needed_offsets.push(val),
+                5 => strtab_vaddr = Some(val),
                 _ => {}
             }
         }
@@ -114,7 +114,6 @@ pub fn read_elf(bytes: &[u8]) -> Option<ElfInfo> {
     })
 }
 
-/// Map a virtual address inside a PT_LOAD segment to a file offset.
 fn vaddr_to_offset(loads: &[(u64, u64, u64)], vaddr: u64) -> Option<u64> {
     for &(base, offset, memsz) in loads {
         if vaddr >= base && vaddr < base + memsz {
@@ -165,7 +164,6 @@ fn rd_u64(b: &[u8], o: usize, le: bool) -> Option<u64> {
     Some(if le { u64::from_le_bytes(arr) } else { u64::from_be_bytes(arr) })
 }
 
-/// Convenience: read ELF info from a file on disk.
 pub fn read_elf_file(path: &Path) -> io::Result<Option<ElfInfo>> {
     let bytes = fs::read(path)?;
     Ok(read_elf(&bytes))
@@ -178,11 +176,11 @@ pub(crate) mod tests {
     pub(crate) fn build_dyn(strtab: &[u8], needed: &[u32], interp: Option<&str>) -> Vec<u8> {
         let mut b = vec![0u8; 4096];
         b[0..4].copy_from_slice(b"\x7fELF");
-        b[4] = 2; // ELF64
-        b[5] = 1; // little-endian
-        b[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
-        b[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
-        b[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[4] = 2;
+        b[5] = 1;
+        b[16..18].copy_from_slice(&3u16.to_le_bytes());
+        b[18..20].copy_from_slice(&62u16.to_le_bytes());
+        b[32..40].copy_from_slice(&64u64.to_le_bytes());
 
         let dyn_off = 512usize;
         let strtab_off = 1024usize;
@@ -190,8 +188,8 @@ pub(crate) mod tests {
 
         let interp_off = 3072usize;
         let nph = if interp.is_some() { 3 } else { 2 };
-        b[54..56].copy_from_slice(&(56u16).to_le_bytes()); // phentsize
-        b[56..58].copy_from_slice(&(nph as u16).to_le_bytes()); // phnum
+        b[54..56].copy_from_slice(&(56u16).to_le_bytes());
+        b[56..58].copy_from_slice(&(nph as u16).to_le_bytes());
         let dyn_bytes = (2 + needed.len()) * 16;
 
         let mut off = 64usize;
@@ -206,7 +204,7 @@ pub(crate) mod tests {
         b[off + 32..off + 40].copy_from_slice(&(dyn_bytes as u64).to_le_bytes());
         off += 56;
         if interp.is_some() {
-            b[off..off + 4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+            b[off..off + 4].copy_from_slice(&3u32.to_le_bytes());
             b[off + 8..off + 16].copy_from_slice(&(interp_off as u64).to_le_bytes());
             b[off + 32..off + 40].copy_from_slice(&64u64.to_le_bytes());
         }
@@ -234,8 +232,8 @@ pub(crate) mod tests {
 
     pub(crate) fn build_dyn_i386(strtab: &[u8], needed: &[u32]) -> Vec<u8> {
         let mut b = build_dyn(strtab, needed, Some("/lib/ld-linux.so.2"));
-        b[4] = 1; // ELF32
-        b[18..20].copy_from_slice(&3u16.to_le_bytes()); // EM_386
+        b[4] = 1;
+        b[18..20].copy_from_slice(&3u16.to_le_bytes());
         b
     }
 

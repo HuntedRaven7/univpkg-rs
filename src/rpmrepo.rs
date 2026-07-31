@@ -1,16 +1,3 @@
-//! Fedora / RPM-based repository support.
-//!
-//! Fedora (and RHEL/CentOS/Rocky/Alma) repos use the DNF/createrepo layout:
-//!
-//! 1. `repomd.xml` — an XML manifest that lists the location of the primary
-//!    database, their type, and checksums.
-//! 2. `primary.xml.gz` (or `.zst`) — an XML file with one `<package>` stanza
-//!    per package containing name, version, arch, dependencies, download URL,
-//!    and checksum.
-//!
-//! We parse the minimal subset of both formats we need with a simple
-//! hand-rolled XML scanner (no external XML library required).
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -22,19 +9,12 @@ use crate::rpm::{self, RpmDep};
 use crate::store::{sha256_hex, Store, StorePath};
 use crate::version;
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
 const DEFAULT_FEDORA_REPO_NAME: &str = "fedora";
 
-/// Default Fedora release version (e.g. "44", "43", "rawhide").
 pub const DEFAULT_FEDORA_VERSION: &str = "44";
 
-/// Custom repository base URL override. Set to `Some("https://...")` to specify
-/// a custom repository URL directly in the code (e.g., custom mirror or local repo),
-/// or `None` to construct the base URL automatically using `DEFAULT_FEDORA_VERSION`.
 pub const CUSTOM_FEDORA_BASE_URL: Option<&str> = None;
 
-/// Construct the default repository base URL for Fedora.
 pub fn default_fedora_base_url() -> String {
     if let Some(url) = CUSTOM_FEDORA_BASE_URL {
         url.to_string()
@@ -47,8 +27,6 @@ pub fn default_fedora_base_url() -> String {
     }
 }
 
-/// RPM packages that are part of every Fedora base system and do not need to
-/// be downloaded.  Mirrors the logic in `repo.rs` for Debian.
 const SYSTEM_PKGS: &[&str] = &[
     "glibc",
     "glibc-common",
@@ -111,7 +89,6 @@ const SYSTEM_PKGS: &[&str] = &[
     "bash",
 ];
 
-/// Host architecture in Fedora/RPM terminology.
 pub fn host_arch() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "x86_64",
@@ -120,8 +97,6 @@ pub fn host_arch() -> &'static str {
         other => other,
     }
 }
-
-// ── Public types ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct FedoraRepo {
@@ -135,13 +110,13 @@ pub struct RpmPackage {
     pub package: String,
     #[allow(dead_code)]
     pub version: String,
-    /// Full EVR as it appears in repodata (e.g. `1.0-1.fc41`).
+
     pub full_version: String,
     pub epoch: u32,
     pub architecture: String,
     pub description: String,
     pub requires: Vec<Vec<RpmDep>>,
-    pub location: String, // relative href in the repo
+    pub location: String,
     pub sha256: Option<String>,
 }
 
@@ -172,11 +147,6 @@ impl Index {
     }
 }
 
-// ── Repo list ─────────────────────────────────────────────────────────────────
-
-/// Return the list of configured RPM repositories.  Config is in
-/// `~/.local/unipkg/rpmrepos.conf`.  Each line: `name url [arch…]`.
-/// Falls back to Fedora 41 if no config exists.
 pub fn repos() -> io::Result<Vec<FedoraRepo>> {
     let conf = Store::root()?.join("rpmrepos.conf");
     let mut out = Vec::new();
@@ -210,8 +180,6 @@ pub fn repos() -> io::Result<Vec<FedoraRepo>> {
     Ok(out)
 }
 
-/// Append a new RPM repository entry to `~/.local/unipkg/rpmrepos.conf`.
-/// `arches` may be empty to default to the host architecture.
 pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
     let conf = Store::root()?.join("rpmrepos.conf");
     if let Some(parent) = conf.parent() {
@@ -231,15 +199,12 @@ pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-// ── Update: fetch & cache repodata ───────────────────────────────────────────
-
 fn cache_path(repo: &FedoraRepo, arch: &str) -> io::Result<PathBuf> {
     Ok(Store::root()?
         .join("cache")
         .join(format!("{}.rpm-primary.{arch}", repo.name)))
 }
 
-/// Fetch and cache the primary package index for each configured architecture.
 pub fn update(repo: &FedoraRepo) -> io::Result<usize> {
     let mut total = 0;
     for arch in &repo.arches {
@@ -249,7 +214,6 @@ pub fn update(repo: &FedoraRepo) -> io::Result<usize> {
         let repomd_text =
             String::from_utf8(repomd_bytes).map_err(io::Error::other)?;
 
-        // Find the href of the primary database.
         let primary_href = find_primary_href(&repomd_text).ok_or_else(|| {
             io::Error::other(format!(
                 "no primary database found in repomd.xml for repo '{}'",
@@ -281,9 +245,8 @@ pub fn update(repo: &FedoraRepo) -> io::Result<usize> {
     Ok(total)
 }
 
-/// Extract the `href` of the `type="primary"` entry from `repomd.xml`.
 fn find_primary_href(repomd: &str) -> Option<String> {
-    // We look for a `<data type="primary">` block and grab the `<location href=...>`.
+
     let mut in_primary = false;
     for line in repomd.lines() {
         let t = line.trim();
@@ -324,12 +287,6 @@ fn decompress_primary(url: &str, bytes: &[u8]) -> io::Result<String> {
     }
 }
 
-// ── primary.xml parsing ───────────────────────────────────────────────────────
-
-/// Parse a `primary.xml` document into an index.
-///
-/// The format is structured XML but we parse it with a simple line-by-line
-/// scanner rather than pulling in an XML library.
 fn parse_primary(text: &str) -> Index {
     let mut index = Index::default();
     let mut pkg = PkgBuilder::default();
@@ -353,7 +310,7 @@ fn parse_primary(text: &str) -> Index {
         } else if t.starts_with("<summary>") {
             pkg.summary = inner_text(t, "summary").map(str::to_string);
         } else if t.starts_with("<version ") {
-            // <version epoch="0" ver="1.0" rel="1.fc41"/>
+
             pkg.epoch = extract_attr(t, "version", "epoch")
                 .and_then(|e| e.parse().ok())
                 .unwrap_or(0);
@@ -418,10 +375,9 @@ impl PkgBuilder {
     }
 }
 
-/// Parse one `<entry name="..." flags="..." ver="..."/>` dependency element.
 fn parse_dep_entry(line: &str) -> Option<RpmDep> {
     let name = extract_attr(line, "entry", "name")?;
-    // Skip file deps, rpmlib pseudo-deps, config, and rich-deps.
+
     if name.starts_with('/') || name.starts_with("rpmlib(") || name.starts_with('(') {
         return None;
     }
@@ -443,8 +399,6 @@ fn parse_dep_entry(line: &str) -> Option<RpmDep> {
     };
     Some(RpmDep { package: name, version })
 }
-
-// ── Index serialisation ───────────────────────────────────────────────────────
 
 fn render_index(index: &Index) -> String {
     let mut all: Vec<&RpmPackage> = index.by_name.values().flatten().collect();
@@ -531,8 +485,6 @@ fn stanza_to_package(stanza: &HashMap<&str, String>) -> Option<RpmPackage> {
     })
 }
 
-// ── Search ────────────────────────────────────────────────────────────────────
-
 pub fn search(repo: &FedoraRepo, query: &str) -> Vec<RpmPackage> {
     let Ok(index) = read_index(repo) else { return Vec::new() };
     let q = query.to_lowercase();
@@ -567,8 +519,6 @@ fn read_index(repo: &FedoraRepo) -> io::Result<Index> {
     }
     Ok(index)
 }
-
-// ── Install ───────────────────────────────────────────────────────────────────
 
 pub fn install(
     store: &Store,
@@ -617,8 +567,6 @@ pub fn install(
     Ok(out)
 }
 
-// ── Dependency planner ────────────────────────────────────────────────────────
-
 fn plan_package(
     installed: &[resolve::Installed],
     index: &Index,
@@ -637,7 +585,6 @@ fn plan_package(
         return Ok(());
     }
 
-    // Already installed?
     if let Some(p) = installed.iter().find(|p| {
         p.meta.package == name
             && (p.meta.architecture == desired || p.meta.architecture == "noarch")
@@ -709,8 +656,6 @@ fn constraint_ok(version: &str, c: Option<&(String, String)>) -> bool {
     }
 }
 
-// ── HTTP helper ───────────────────────────────────────────────────────────────
-
 fn http_get(url: &str) -> io::Result<Vec<u8>> {
     match ureq::get(url).call() {
         Ok(mut res) => res
@@ -727,14 +672,10 @@ fn http_get(url: &str) -> io::Result<Vec<u8>> {
     }
 }
 
-const MAX_BODY: usize = 256 * 1024 * 1024; // 256 MiB
+const MAX_BODY: usize = 256 * 1024 * 1024;
 
-// ── XML mini-helpers ──────────────────────────────────────────────────────────
-
-/// Extract the value of `attr` from an XML element whose tag name is `tag`.
-/// Handles both single- and double-quoted attribute values.
 fn extract_attr(line: &str, _tag: &str, attr: &str) -> Option<String> {
-    // Look for `attr="value"` or `attr='value'`
+
     let key_dq = format!("{attr}=\"");
     let key_sq = format!("{attr}='");
     for (key, close) in [(&key_dq, '"'), (&key_sq, '\'')] {
@@ -748,12 +689,11 @@ fn extract_attr(line: &str, _tag: &str, attr: &str) -> Option<String> {
     None
 }
 
-/// Extract the text content of a simple `<tag>content</tag>` element.
 fn inner_text<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
     let start = line.find(&open)?;
-    // Skip past the closing `>` of the open tag.
+
     let after_open = line[start..].find('>')? + start + 1;
     let end = line.find(&close)?;
     if end >= after_open {
@@ -762,8 +702,6 @@ fn inner_text<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
         None
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -867,7 +805,7 @@ mod tests {
         assert_eq!(p.full_version, "5.2.21-4.fc41");
         assert_eq!(p.architecture, "x86_64");
         assert!(p.location.contains("bash-5.2.21"));
-        // /bin/sh dep must be filtered out; glibc dep kept.
+
         assert_eq!(p.requires.len(), 1);
         assert_eq!(p.requires[0][0].package, "glibc");
         assert_eq!(

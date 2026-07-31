@@ -129,11 +129,11 @@ mod tests {
         lt("1.0+dfsg1", "2.0");
         assert_eq!(compare("1.0", "1.0"), Equal);
         assert_eq!(compare("1.0-0", "1.0"), Equal);
-        // epoch wins over everything
+
         lt("2.0", "1:1.0");
         lt("1:2.0", "2:0.1");
         assert_eq!(compare("1:1.0", "1:1.0-1"), Less);
-        // revision comparisons
+
         lt("1.0-1", "1.0-2");
         lt("1.0-1.1", "1.0-1.2");
     }
