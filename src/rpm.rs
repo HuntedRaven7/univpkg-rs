@@ -1,25 +1,9 @@
-//! Parse and install RPM packages (`.rpm` files).
-//!
-//! RPM binary layout:
-//!
-//! 1. **Lead** (96 bytes, ignored after magic check)
-//! 2. **Signature section** — a Header Structure that is skipped; it is
-//!    word-aligned after its end.
-//! 3. **Header section** — the actual package metadata (name, version, arch,
-//!    summary, requires, …).  We parse only the tags we care about.
-//! 4. **Payload** — a CPIO archive, compressed with gzip, xz, or zstd.
-//!
-//! We never write outside the store: the CPIO extractor rejects absolute paths
-//! and `..` components before touching the filesystem.
-
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::Path;
 
 use crate::store::{HashingReader, Sha256, Store, StorePath};
-
-// ── RPM tag numbers we care about ────────────────────────────────────────────
 
 const TAG_NAME: u32 = 1000;
 const TAG_VERSION: u32 = 1001;
@@ -32,11 +16,9 @@ const TAG_REQUIREVERSION: u32 = 1050;
 #[allow(dead_code)]
 const TAG_PAYLOADCOMPRESSOR: u32 = 1125;
 
-// REQUIREFLAGS bits
 const RPMSENSE_LESS: u32 = 0x02;
 const RPMSENSE_GREATER: u32 = 0x04;
 const RPMSENSE_EQUAL: u32 = 0x08;
-// Ignore deps that are really file paths, rpmlib pseudo-deps, or config deps.
 const RPMSENSE_RPMLIB: u32 = 0x1000000;
 const RPMSENSE_SCRIPT_PRE: u32 = 0x200;
 const RPMSENSE_SCRIPT_POST: u32 = 0x400;
@@ -50,21 +32,16 @@ const IGNORE_FLAGS: u32 = RPMSENSE_RPMLIB
     | RPMSENSE_SCRIPT_POSTUN
     | RPMSENSE_CONFIG;
 
-// ── Public types ──────────────────────────────────────────────────────────────
-
-/// Metadata extracted from an RPM header.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RpmMeta {
     pub package: String,
     pub version: String,
-    /// The full EVR string (`epoch:version-release` or `version-release`).
     pub full_version: String,
     pub architecture: String,
     pub description: String,
     pub requires: Vec<Vec<RpmDep>>,
 }
 
-/// One RPM dependency entry.  `version` is `None` for unversioned deps.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RpmDep {
     pub package: String,
@@ -72,37 +49,28 @@ pub struct RpmDep {
 }
 
 impl RpmDep {
-    /// A dependency with no version constraint.
     #[cfg(test)]
     pub fn package_only(name: &str) -> RpmDep {
         RpmDep { package: name.to_string(), version: None }
     }
 }
 
-// ── Main entry point ──────────────────────────────────────────────────────────
-
-/// Parse and install an RPM.  Returns `(store_path, metadata)`.
 pub fn install(store: &Store, rpm: &[u8]) -> io::Result<(StorePath, RpmMeta)> {
-    // Check magic: RPM files start with 0xEDABEEDB.
     if rpm.len() < 4 || &rpm[..4] != b"\xed\xab\xee\xdb" {
         return Err(invalid("not an RPM file (bad magic)"));
     }
 
     let mut pos = 96usize; // skip the 96-byte lead
 
-    // Skip the signature header section (tag count + data size determine its
-    // length, then align to 8 bytes).
     let sig_end = skip_header(rpm, pos)?;
     pos = align8(sig_end);
 
-    // Parse the main header.
     let (meta, header_end) = parse_header(rpm, pos)?;
     if meta.package.is_empty() || meta.version.is_empty() {
         return Err(invalid("RPM header missing Name or Version tag"));
     }
     pos = header_end;
 
-    // The rest of the file is the compressed CPIO payload.
     let payload = &rpm[pos..];
 
     let name = {
@@ -121,12 +89,6 @@ pub fn install(store: &Store, rpm: &[u8]) -> io::Result<(StorePath, RpmMeta)> {
     Ok((sp, meta))
 }
 
-// ── Header parsing ────────────────────────────────────────────────────────────
-
-/// Skip a header structure starting at `pos`, returning the offset after it.
-///
-/// Header structure: magic (8 bytes) + nindex (4) + hsize (4) + index entries
-/// (nindex × 16) + data blob (hsize bytes).
 fn skip_header(data: &[u8], pos: usize) -> io::Result<usize> {
     require(data, pos, 16)?;
     if &data[pos..pos + 3] != b"\x8e\xad\xe8" {
@@ -139,7 +101,6 @@ fn skip_header(data: &[u8], pos: usize) -> io::Result<usize> {
     Ok(end)
 }
 
-/// Parse a Header Structure into `(RpmMeta, end_offset)`.
 fn parse_header(data: &[u8], pos: usize) -> io::Result<(RpmMeta, usize)> {
     require(data, pos, 16)?;
     if &data[pos..pos + 3] != b"\x8e\xad\xe8" {
@@ -155,7 +116,6 @@ fn parse_header(data: &[u8], pos: usize) -> io::Result<(RpmMeta, usize)> {
 
     let store = &data[data_start..end];
 
-    // Collect all tags into a map: tag → (type, offset, count)
     let mut tags: HashMap<u32, (u32, usize, u32)> = HashMap::new();
     for i in 0..nindex {
         let ie = index_start + i * 16;
@@ -207,7 +167,6 @@ fn parse_header(data: &[u8], pos: usize) -> io::Result<(RpmMeta, usize)> {
         format!("{version}-{release}")
     };
 
-    // Build requires list, filtering out pseudo-deps.
     let req_names = read_string_array(TAG_REQUIRENAME);
     let req_flags = read_int32_array(TAG_REQUIREFLAGS);
     let req_versions = read_string_array(TAG_REQUIREVERSION);
@@ -242,14 +201,10 @@ fn parse_header(data: &[u8], pos: usize) -> io::Result<(RpmMeta, usize)> {
 
 impl RpmMeta {
     fn version_compressor(&self, _payload: &[u8]) -> String {
-        // We re-parse compressor from payload magic instead of storing it in
-        // meta, so detect it here from the payload bytes.
         String::new()
     }
 }
 
-/// Detect the compression format of `payload` from its magic bytes and return a
-/// label matching PAYLOADCOMPRESSOR tag values.
 fn detect_compressor(payload: &[u8]) -> &'static str {
     if payload.starts_with(b"\xfd7zXZ\x00") {
         "xz"
@@ -281,9 +236,6 @@ fn flags_to_op(flags: u32) -> String {
     }
 }
 
-// ── CPIO unpacking ────────────────────────────────────────────────────────────
-
-/// Decompress the payload and unpack the CPIO archive into `dir`.
 fn unpack_payload(payload: &[u8], _hint: &str, dir: &Path, ctx: &mut Sha256) -> io::Result<()> {
     let compressor = detect_compressor(payload);
     let mut decompressed: Box<dyn Read> = match compressor {
@@ -306,13 +258,8 @@ fn unpack_payload(payload: &[u8], _hint: &str, dir: &Path, ctx: &mut Sha256) -> 
     unpack_cpio(&mut hashing, dir)
 }
 
-/// Unpack a newc (SVR4 ASCII) CPIO archive from `reader` into `dir`.
-///
-/// We only support the `newc` (070701/070702) format which is what rpm uses.
-/// Absolute paths and `..` path components are rejected to prevent traversal.
 fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
     loop {
-        // Read the 110-byte newc header.
         let mut hdr = [0u8; 110];
         match read_exact_or_eof(reader, &mut hdr)? {
             0 => break, // EOF before any header byte — treat as end of archive
@@ -320,8 +267,6 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
             _ => return Err(invalid("truncated CPIO header")),
         }
         if &hdr[..6] != b"070701" && &hdr[..6] != b"070702" {
-            // Could be the TRAILER entry with padding; try to keep going for
-            // the common case where we hit the TRAILER.
             if &hdr[..6] == b"TRAILR" || hdr[..6].starts_with(b"TRAILER") {
                 break;
             }
@@ -335,10 +280,8 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
         let filesize = hex8(&hdr[54..62])? as u64;
         let mode = hex4(&hdr[14..22])?;
 
-        // Read filename.
         let mut namebuf = vec![0u8; namesize];
         read_exact(reader, &mut namebuf)?;
-        // Pad header+name to 4-byte boundary.
         skip_pad(reader, (110 + namesize) % 4)?;
 
         let name_bytes = namebuf.strip_suffix(&[0]).unwrap_or(&namebuf);
@@ -349,12 +292,10 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
             .to_string();
 
         if name == "TRAILER!!!" {
-            // Consume the rest of the file data (should be 0) and stop.
             skip_bytes(reader, filesize)?;
             break;
         }
 
-        // Reject path traversal.
         if name.split('/').any(|c| c == "..") {
             skip_bytes(reader, filesize)?;
             skip_pad(reader, filesize as usize % 4)?;
@@ -367,7 +308,6 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
         const S_IFLNK: u32 = 0o12;
 
         if file_type == S_IFDIR || name.is_empty() {
-            // Directory entry.
             skip_bytes(reader, filesize)?;
             skip_pad(reader, filesize as usize % 4)?;
             if !name.is_empty() {
@@ -375,7 +315,6 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
                 fs::create_dir_all(&target)?;
             }
         } else if file_type == S_IFLNK {
-            // Symlink: data is the link target.
             let mut link_target = vec![0u8; filesize as usize];
             read_exact(reader, &mut link_target)?;
             skip_pad(reader, filesize as usize % 4)?;
@@ -385,12 +324,9 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
                     fs::create_dir_all(parent)?;
                 }
                 let target_str = String::from_utf8_lossy(&link_target).into_owned();
-                // Best-effort: skip if symlink already exists or target is absolute
-                // (relative symlinks within the tree are fine).
                 let _ = std::os::unix::fs::symlink(&target_str, &dest);
             }
         } else if file_type == S_IFREG {
-            // Regular file.
             if !name.is_empty() {
                 let dest = dir.join(&name);
                 if let Some(parent) = dest.parent() {
@@ -405,7 +341,6 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
                     io::Write::write_all(&mut file, &buf[..chunk])?;
                     remaining -= chunk as u64;
                 }
-                // Set executable bits.
                 let file_mode = mode & 0o777;
                 if file_mode != 0 {
                     use std::os::unix::fs::PermissionsExt;
@@ -425,9 +360,6 @@ fn unpack_cpio(reader: &mut dyn Read, dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-// ── Metadata persistence ──────────────────────────────────────────────────────
-
-/// Persist RPM metadata next to the link manifest.
 pub fn write_meta(meta: &RpmMeta, sp: &StorePath) -> io::Result<()> {
     let dir = Store::state_dir()?.join(sp.to_string());
     fs::create_dir_all(&dir)?;
@@ -515,12 +447,6 @@ pub(crate) fn parse_requires_field(s: &str) -> Vec<Vec<RpmDep>> {
         .collect()
 }
 
-// ── Convert RpmMeta ↔ DebMeta ─────────────────────────────────────────────────
-//
-// The rest of the system (link, resolve) uses `DebMeta` as the universal
-// installed-package record.  We convert here so we don't need to plumb a
-// second generic type throughout the codebase.
-
 use crate::deb::{DebMeta, Dep};
 
 impl From<RpmMeta> for DebMeta {
@@ -541,8 +467,6 @@ impl From<RpmMeta> for DebMeta {
     }
 }
 
-// ── Helper utilities ──────────────────────────────────────────────────────────
-
 fn require(data: &[u8], pos: usize, need: usize) -> io::Result<()> {
     if pos + need > data.len() {
         Err(invalid(format!(
@@ -560,7 +484,6 @@ fn align8(n: usize) -> usize {
     (n + 7) & !7
 }
 
-/// Read a hex string of exactly `N` chars as a u32. Used for CPIO header fields.
 fn hex4(s: &[u8]) -> io::Result<u32> {
     let text = std::str::from_utf8(s).map_err(|_| invalid("non-ASCII CPIO field"))?;
     u32::from_str_radix(text, 16).map_err(|e| invalid(format!("bad CPIO hex field '{text}': {e}")))
@@ -580,8 +503,6 @@ fn read_exact(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<()> {
     reader.read_exact(buf)
 }
 
-/// Like `read_exact` but returns how many bytes were read on the first call.
-/// Returns `0` on immediate EOF, `buf.len()` if the whole buffer was filled.
 fn read_exact_or_eof(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
@@ -625,13 +546,11 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a minimal newc CPIO archive with one regular file entry.
     fn cpio_newc(entries: &[(&str, &[u8], u32)], include_trailer: bool) -> Vec<u8> {
         let mut out = Vec::new();
         for (name, data, mode) in entries {
@@ -646,7 +565,6 @@ mod tests {
     fn write_cpio_entry(out: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) {
         let namesize = name.len() + 1; // include NUL
         let filesize = data.len();
-        // The actual newc format fields:
         let hdr = format!(
             "070701{ino:08X}{mode:08X}{uid:08X}{gid:08X}{nlink:08X}{mtime:08X}{filesize:08X}{devmajor:08X}{devminor:08X}{rdevmajor:08X}{rdevminor:08X}{namesize:08X}{check:08X}",
             ino = 0u32,
@@ -667,13 +585,10 @@ mod tests {
         out.extend_from_slice(hdr.as_bytes());
         out.extend_from_slice(name.as_bytes());
         out.push(0); // NUL
-        // Pad to 4-byte boundary after header+name
         let after = 110 + namesize;
         let pad = (4 - after % 4) % 4;
         out.extend(std::iter::repeat(0u8).take(pad));
-        // File data
         out.extend_from_slice(data);
-        // Pad data to 4-byte boundary
         let data_pad = (4 - filesize % 4) % 4;
         out.extend(std::iter::repeat(0u8).take(data_pad));
     }
@@ -687,11 +602,7 @@ mod tests {
         (dir, store)
     }
 
-    /// Build a minimal but structurally valid RPM binary with the given CPIO
-    /// payload (uncompressed — we write 'gzip' as the compressor tag but
-    /// actually pass a gzip stream).
     fn make_rpm_gzip(meta: &RpmMeta, cpio: Vec<u8>) -> Vec<u8> {
-        // Gzip the CPIO.
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         use std::io::Write;
         gz.write_all(&cpio).unwrap();
@@ -699,8 +610,6 @@ mod tests {
         build_rpm(meta, &payload)
     }
 
-    /// Build a minimal RPM with raw (uncompressed) CPIO (no magic prefix
-    /// matches gz/xz/zstd so it falls through as uncompressed).
     fn make_rpm_raw(meta: &RpmMeta, cpio: Vec<u8>) -> Vec<u8> {
         build_rpm(meta, &cpio)
     }
@@ -708,28 +617,21 @@ mod tests {
     fn build_rpm(meta: &RpmMeta, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
 
-        // Lead (96 bytes).
         out.extend_from_slice(b"\xed\xab\xee\xdb"); // magic
         out.extend_from_slice(&[0u8; 92]); // rest of lead
 
-        // Signature section: minimal — just the required magic + empty index.
         out.extend_from_slice(&build_header_section(&[]));
-        // Align to 8 bytes.
         while out.len() % 8 != 0 {
             out.push(0);
         }
 
-        // Main header with tags.
         let tags = make_header_tags(meta);
         out.extend_from_slice(&build_header_section(&tags));
 
-        // Payload.
         out.extend_from_slice(payload);
         out
     }
 
-    /// A tag entry for build_header_section: (tag, type, data).
-    /// type 6 = STRING, type 8 = STRING_ARRAY, type 4 = INT32.
     fn make_header_tags(meta: &RpmMeta) -> Vec<(u32, u32, Vec<u8>)> {
         let mut tags = Vec::new();
         tags.push((TAG_NAME, 6, cstr(meta.package.as_bytes())));
@@ -817,7 +719,6 @@ mod tests {
     #[test]
     fn cpio_path_traversal_rejected() {
         let (dir, store) = store_for_test("traversal");
-        // Build a CPIO with a path traversal entry.
         let cpio = cpio_newc(
             &[
                 ("./usr/bin/ok", b"fine", 0o100644),
@@ -834,10 +735,8 @@ mod tests {
             requires: vec![],
         };
         let rpm = make_rpm_raw(&meta, cpio);
-        // install may succeed (traversal entry is skipped, not errored)
         if let Ok((sp, _)) = install(&store, &rpm) {
             let dest = store.base().join(sp.to_string());
-            // The traversal file must NOT exist in the store.
             assert!(!dest.join("../evil.txt").exists());
             assert!(!store.base().join("evil.txt").exists());
         }

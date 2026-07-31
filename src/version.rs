@@ -1,10 +1,5 @@
-//! Debian package version comparison (the dpkg algorithm) and constraint
-//! matching, used to pick dependency candidates and check them against
-//! `Depends` constraints.
-
 use std::cmp::Ordering;
 
-/// Compare two Debian version strings per the dpkg ordering rules.
 pub fn compare(a: &str, b: &str) -> Ordering {
     let (ea, ra) = split_epoch(a);
     let (eb, rb) = split_epoch(b);
@@ -20,8 +15,6 @@ pub fn compare(a: &str, b: &str) -> Ordering {
     }
 }
 
-/// Check `candidate` against a constraint like `>= 1.0`. `op` is one of
-/// `<<`, `<=`, `=`, `>=`, `>>`.
 pub fn satisfies(candidate: &str, op: &str, requirement: &str) -> bool {
     let ord = compare(candidate, requirement);
     match op {
@@ -34,7 +27,6 @@ pub fn satisfies(candidate: &str, op: &str, requirement: &str) -> bool {
     }
 }
 
-/// Parse `[epoch:]upstream[-revision]` and return `(epoch, rest)`.
 fn split_epoch(s: &str) -> (u64, &str) {
     match s.split_once(':') {
         Some((e, rest))
@@ -46,7 +38,6 @@ fn split_epoch(s: &str) -> (u64, &str) {
     }
 }
 
-/// Split `upstream[-revision]`; a missing revision compares as `"0"`.
 fn split_revision(s: &str) -> (&str, &str) {
     match s.rsplit_once('-') {
         Some((upstream, rev)) => (upstream, rev),
@@ -54,9 +45,6 @@ fn split_revision(s: &str) -> (&str, &str) {
     }
 }
 
-/// Character ordering used inside `verrevcmp`, matching dpkg's `order()`:
-/// `~` sorts before everything (including the end of string), digits and the
-/// end of string sort next, then letters, then punctuation.
 fn order(c: u8) -> i32 {
     match c {
         0 => 0,
@@ -67,13 +55,10 @@ fn order(c: u8) -> i32 {
     }
 }
 
-/// The dpkg `verrevcmp` core.
 fn verrevcmp(mut a: &[u8], mut b: &[u8]) -> Ordering {
     loop {
         let mut first_diff = 0;
 
-        // Consume non-digit runs on both sides, comparing position by
-        // position via `order`.
         while (a.first().is_some_and(|&c| !c.is_ascii_digit()))
             || (b.first().is_some_and(|&c| !c.is_ascii_digit()))
         {
@@ -87,7 +72,6 @@ fn verrevcmp(mut a: &[u8], mut b: &[u8]) -> Ordering {
             b = b.get(1..).unwrap_or_default();
         }
 
-        // Skip leading zeros, then compare digit runs numerically.
         while a.first() == Some(&b'0') {
             a = &a[1..];
         }
@@ -104,7 +88,6 @@ fn verrevcmp(mut a: &[u8], mut b: &[u8]) -> Ordering {
             b = &b[1..];
         }
 
-        // A remaining digit run on one side makes it larger.
         if a.first().is_some_and(|c| c.is_ascii_digit()) {
             return Ordering::Greater;
         }
@@ -117,8 +100,6 @@ fn verrevcmp(mut a: &[u8], mut b: &[u8]) -> Ordering {
         if a.is_empty() && b.is_empty() {
             return Ordering::Equal;
         }
-        // Otherwise both sides are at digit-or-end; loop to consume the
-        // next non-digit run.
     }
 }
 

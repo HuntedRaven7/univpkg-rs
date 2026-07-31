@@ -94,6 +94,42 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "add-repo" => {
+            let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+            if rest.len() < 2 {
+                eprintln!("usage: unipkg add-repo <name> <base-url> [arch ...]");
+                return ExitCode::FAILURE;
+            }
+            let (name, base, arches) = parse_repo_args(&rest);
+            match repo::add_repo(&name, &base, &arches) {
+                Ok(()) => {
+                    println!("added deb repo '{name}' -> {base}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("unipkg: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "add-rpm-repo" => {
+            let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+            if rest.len() < 2 {
+                eprintln!("usage: unipkg add-rpm-repo <name> <base-url> [arch ...]");
+                return ExitCode::FAILURE;
+            }
+            let (name, base, arches) = parse_repo_args(&rest);
+            match rpmrepo::add_repo(&name, &base, &arches) {
+                Ok(()) => {
+                    println!("added rpm repo '{name}' -> {base}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("unipkg: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "update" => {
             let repos = match repo::repos() {
                 Ok(r) => r,
@@ -220,17 +256,37 @@ fn main() -> ExitCode {
             }
             let shown = results.len().min(100);
             for p in &results[..shown] {
+                // ANSI color codes for pretty output
+                const RESET: &str = "\x1b[0m";
+                const BOLD_CYAN: &str = "\x1b[1;36m";
+                const GREEN: &str = "\x1b[32m";
+                const YELLOW: &str = "\x1b[33m";
+                const MAGENTA: &str = "\x1b[35m";
+                const DIM: &str = "\x1b[2m";
+                let desc_part = if p.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(" - {}{}{}", DIM, p.description, RESET)
+                };
+                // Choose colors based on package kind (deb vs rpm)
+                let (pkg_color, ver_color) = if p.kind == "rpm" {
+                    (YELLOW, GREEN) // rpm packages highlighted with yellow name
+                } else {
+                    (BOLD_CYAN, GREEN) // deb packages retain previous colors
+                };
                 println!(
-                    "{} {} [{}] ({}){}",
+                    "{}{}{} {}{}{} [{}] {}{}{}{}",
+                    pkg_color,
                     p.package,
+                    RESET,
+                    ver_color,
                     p.version,
+                    RESET,
                     p.architecture,
+                    MAGENTA,
                     p.kind,
-                    if p.description.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" - {}", p.description)
-                    }
+                    RESET,
+                    desc_part
                 );
             }
             if results.len() > shown {
@@ -411,13 +467,15 @@ fn print_help() {
     println!();
     println!("  -- Debian / Ubuntu (APT/deb) --");
     println!("  update                  refresh the deb package index from repos");
-    println!("  search <query>          search cached deb package indexes");
+    println!("  add-repo <n> <url> [a…] append a deb repo to ~/.local/unipkg/debrepos.conf");
+    println!("  search <query>          search cached package indexes (deb & rpm)");
     println!("  install <file.deb>      install a .deb from disk");
     println!("  install <package>       install a deb package (with deps) from a repo");
     println!("  install-deb <package>   install a deb package by name");
     println!();
     println!("  -- Fedora / RPM (DNF/rpm) --");
     println!("  update-rpm              refresh the RPM package index from repos");
+    println!("  add-rpm-repo <n> <url>  append an RPM repo to ~/.local/unipkg/rpmrepos.conf");
     println!("  install <file.rpm>      install a .rpm from disk");
     println!("  install-rpm <package>   install an RPM package (with deps) from a repo");
     println!("  install-rpm <file.rpm>  install a .rpm from disk");
@@ -620,4 +678,11 @@ fn on_path(dir: &std::path::Path) -> bool {
     std::env::var("PATH")
         .map(|p| p.split(':').any(|d| !d.is_empty() && std::path::Path::new(d) == dir))
         .unwrap_or(false)
+}
+
+fn parse_repo_args(rest: &[&str]) -> (String, String, Vec<String>) {
+    let name = rest[0].to_string();
+    let base = rest[1].to_string();
+    let arches: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
+    (name, base, arches)
 }

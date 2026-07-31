@@ -4,9 +4,7 @@ use std::path::Path;
 
 pub struct ElfInfo {
     pub e_type: u16,
-    /// 1 = ELF32, 2 = ELF64.
     pub class: u8,
-    /// `e_machine` (e.g. 3 = i386, 62 = x86-64, 183 = aarch64).
     pub machine: u16,
     pub interpreter: Option<String>,
     pub needed: Vec<String>,
@@ -18,14 +16,12 @@ impl ElfInfo {
     }
 }
 
-/// Read dynamic dependency info from an ELF file. Returns `None` if the file
-/// is not ELF, and `Some` with empty `needed` for static binaries.
 pub fn read_elf(bytes: &[u8]) -> Option<ElfInfo> {
     if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
         return None;
     }
-    let class = bytes[4]; // 1 = ELF32, 2 = ELF64
-    let le = bytes[5] == 1; // 1 = little-endian
+    let class = bytes[4]; 
+    let le = bytes[5] == 1; 
     if !(class == 1 || class == 2) || (bytes[5] != 1 && bytes[5] != 2) {
         return None;
     }
@@ -47,8 +43,8 @@ pub fn read_elf(bytes: &[u8]) -> Option<ElfInfo> {
     };
 
     let mut interpreter = None;
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new(); 
     let mut dynamic: Option<(u64, u64)> = None;
-    let mut loads: Vec<(u64, u64, u64)> = Vec::new(); // (vaddr, offset, memsz)
 
     for i in 0..phnum {
         let off = phoff.checked_add(i * phentsize)?;
@@ -90,9 +86,9 @@ pub fn read_elf(bytes: &[u8]) -> Option<ElfInfo> {
                 ),
             };
             match tag {
-                0 => break, // DT_NULL
-                1 => needed_offsets.push(val), // DT_NEEDED
-                5 => strtab_vaddr = Some(val),  // DT_STRTAB
+                0 => break, 
+                1 => needed_offsets.push(val), 
+                5 => strtab_vaddr = Some(val), 
                 _ => {}
             }
         }
@@ -180,8 +176,6 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn build_dyn(strtab: &[u8], needed: &[u32], interp: Option<&str>) -> Vec<u8> {
-        // Hand-assemble a 64-bit little-endian ELF with one PT_LOAD covering
-        // everything, one PT_DYNAMIC, and an optional PT_INTERP.
         let mut b = vec![0u8; 4096];
         b[0..4].copy_from_slice(b"\x7fELF");
         b[4] = 2; // ELF64
@@ -200,16 +194,13 @@ pub(crate) mod tests {
         b[56..58].copy_from_slice(&(nph as u16).to_le_bytes()); // phnum
         let dyn_bytes = (2 + needed.len()) * 16;
 
-        // Program headers start at offset 64.
         let mut off = 64usize;
-        // PT_LOAD covering [0, 4096)
         b[off..off + 4].copy_from_slice(&1u32.to_le_bytes());
         b[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes());
         b[off + 16..off + 24].copy_from_slice(&0u64.to_le_bytes());
         b[off + 32..off + 40].copy_from_slice(&4096u64.to_le_bytes());
         b[off + 40..off + 48].copy_from_slice(&4096u64.to_le_bytes());
         off += 56;
-        // PT_DYNAMIC
         b[off..off + 4].copy_from_slice(&2u32.to_le_bytes());
         b[off + 8..off + 16].copy_from_slice(&(dyn_off as u64).to_le_bytes());
         b[off + 32..off + 40].copy_from_slice(&(dyn_bytes as u64).to_le_bytes());
@@ -220,12 +211,9 @@ pub(crate) mod tests {
             b[off + 32..off + 40].copy_from_slice(&64u64.to_le_bytes());
         }
 
-        // strtab
         b[strtab_off..strtab_off + strtab.len()].copy_from_slice(strtab);
-        // data (unused here)
         b[data_off..data_off + 4].copy_from_slice(b"DATA");
 
-        // dynamic entries: strtab, then needed offsets, then NULL
         let mut e = dyn_off;
         b[e..e + 8].copy_from_slice(&5i64.to_le_bytes());
         b[e + 8..e + 16].copy_from_slice(&(strtab_off as u64).to_le_bytes());
@@ -244,9 +232,6 @@ pub(crate) mod tests {
         b
     }
 
-    /// `build_dyn` patched into a (loosely valid) ELF32/i386 binary. The
-    /// program headers are not re-laid out, but `read_elf` still reports the
-    /// class and machine, which is all `resolve` needs to distinguish archs.
     pub(crate) fn build_dyn_i386(strtab: &[u8], needed: &[u32]) -> Vec<u8> {
         let mut b = build_dyn(strtab, needed, Some("/lib/ld-linux.so.2"));
         b[4] = 1; // ELF32

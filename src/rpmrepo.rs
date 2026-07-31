@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use crate::deb::DebMeta;
@@ -208,6 +208,27 @@ pub fn repos() -> io::Result<Vec<FedoraRepo>> {
         });
     }
     Ok(out)
+}
+
+/// Append a new RPM repository entry to `~/.local/unipkg/rpmrepos.conf`.
+/// `arches` may be empty to default to the host architecture.
+pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
+    let conf = Store::root()?.join("rpmrepos.conf");
+    if let Some(parent) = conf.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let arches_part = if arches.is_empty() {
+        host_arch().to_string()
+    } else {
+        arches.join(" ")
+    };
+    let line = format!("{name} {base} {arches_part}\n");
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&conf)?
+        .write_all(line.as_bytes())?;
+    Ok(())
 }
 
 // ── Update: fetch & cache repodata ───────────────────────────────────────────
@@ -692,7 +713,12 @@ fn constraint_ok(version: &str, c: Option<&(String, String)>) -> bool {
 
 fn http_get(url: &str) -> io::Result<Vec<u8>> {
     match ureq::get(url).call() {
-        Ok(res) => res.into_body().read_to_vec().map_err(io::Error::other),
+        Ok(mut res) => res
+            .body_mut()
+            .with_config()
+            .limit(MAX_BODY.try_into().unwrap())
+            .read_to_vec()
+            .map_err(io::Error::other),
         Err(ureq::Error::StatusCode(404)) => Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("{url}: not found"),
@@ -700,6 +726,8 @@ fn http_get(url: &str) -> io::Result<Vec<u8>> {
         Err(e) => Err(io::Error::other(format!("{url}: {e}"))),
     }
 }
+
+const MAX_BODY: usize = 256 * 1024 * 1024; // 256 MiB
 
 // ── XML mini-helpers ──────────────────────────────────────────────────────────
 

@@ -1,11 +1,3 @@
-//! Runtime dependency resolution for store binaries.
-//!
-//! The base system provides a set of shared libraries (glibc, X11, etc.)
-//! that we always reuse. Anything a store binary needs *beyond* that must
-//! come from an installed store package; the directories that provide those
-//! libraries are what the launcher wrappers in `link.rs` put on
-//! `LD_LIBRARY_PATH`.
-
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -44,14 +36,12 @@ const STORE_LIB_DIRS: &[&str] = &[
     "lib64",
 ];
 
-/// An installed store path with its persisted metadata.
 pub struct Installed {
     pub sp: StorePath,
     pub meta: DebMeta,
     pub root: PathBuf,
 }
 
-/// Every store path that has metadata persisted under the state dir.
 pub fn installed_packages(store: &Store) -> Vec<Installed> {
     store
         .paths()
@@ -65,9 +55,6 @@ pub fn installed_packages(store: &Store) -> Vec<Installed> {
         .collect()
 }
 
-/// Absolute path of `soname` in the base system, if present. Only files whose
-/// ELF class and machine match `(class, machine)` are considered, so an amd64
-/// binary never binds an i386 system library.
 pub fn system_library(soname: &str, class: u8, machine: u16) -> Option<PathBuf> {
     SYSTEM_LIB_DIRS
         .iter()
@@ -76,8 +63,6 @@ pub fn system_library(soname: &str, class: u8, machine: u16) -> Option<PathBuf> 
         .find(|p| p.exists() && arch_matches(p, class, machine))
 }
 
-/// The directory inside an installed package that provides `soname` with a
-/// matching architecture, if any.
 fn store_library(pkg: &Installed, soname: &str, class: u8, machine: u16) -> Option<PathBuf> {
     for rel in STORE_LIB_DIRS {
         let dir = pkg.root.join(rel);
@@ -89,9 +74,6 @@ fn store_library(pkg: &Installed, soname: &str, class: u8, machine: u16) -> Opti
     None
 }
 
-/// True if `file` is not ELF (e.g. an ld linker script) or is ELF of the
-/// given class and machine. Non-ELF files are allowed through so they can
-/// still be picked up at runtime.
 fn arch_matches(file: &Path, class: u8, machine: u16) -> bool {
     match elf::read_elf_file(file).ok().flatten() {
         Some(info) => info.class == class && info.machine == machine,
@@ -99,15 +81,10 @@ fn arch_matches(file: &Path, class: u8, machine: u16) -> bool {
     }
 }
 
-/// Where a given shared library comes from.
 #[derive(Clone, Debug)]
 pub enum LibSource {
-    /// The base system provides it.
     System(PathBuf),
-    /// An installed store package provides it; `dir` must be on
-    /// `LD_LIBRARY_PATH` for anything that links against it.
     Store { package: String, dir: PathBuf },
-    /// Neither the store nor the base system has it.
     Missing,
 }
 
@@ -117,10 +94,6 @@ pub struct ResolvedLib {
     pub source: LibSource,
 }
 
-/// Resolve every shared library reachable from `binary`, transitively
-/// following the `DT_NEEDED` entries of store-provided libraries. Installed
-/// store packages are preferred over the base system so the versions bundled
-/// in the store win.
 pub fn resolve_binary(binary: &Path, installed: &[Installed]) -> Vec<ResolvedLib> {
     let mut resolved: Vec<ResolvedLib> = Vec::new();
     let mut handled: BTreeSet<PathBuf> = BTreeSet::new();
@@ -169,8 +142,6 @@ pub fn resolve_binary(binary: &Path, installed: &[Installed]) -> Vec<ResolvedLib
     resolved
 }
 
-/// The store directories that must go on `LD_LIBRARY_PATH` for a binary
-/// given its resolved dependencies.
 pub fn store_lib_dirs(deps: &[ResolvedLib]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for d in deps {
@@ -183,7 +154,6 @@ pub fn store_lib_dirs(deps: &[ResolvedLib]) -> Vec<PathBuf> {
     out
 }
 
-/// The dynamic linker the binary was built against (`PT_INTERP`), if any.
 pub fn interpreter(binary: &Path) -> Option<String> {
     elf::read_elf_file(binary)
         .ok()
@@ -197,8 +167,6 @@ mod tests {
     use crate::store::test_store;
     use std::fs;
 
-    /// Build an ELF binary in the store whose interpreter and needed libs are
-    /// all hand-assembled with `elf::tests::build_dyn`.
     fn write_bin(
         store: &Store,
         name: &str,
@@ -257,7 +225,6 @@ mod tests {
         .unwrap();
         let app = installed(&store, &app_sp, "app");
 
-        // libfoo provided by an installed libfoo package
         let lib_sp = store
             .add_tree("libfoo", |dir, _ctx| {
                 fs::create_dir_all(dir.join("usr/lib/x86_64-linux-gnu"))?;
@@ -304,8 +271,6 @@ mod tests {
         .unwrap();
         let _app = installed(&store, &app_sp, "app");
 
-        // Two packages with the same soname: amd64 and i386. The i386 one
-        // comes first on purpose; it must be rejected by arch matching.
         let lib64_sp = store
             .add_tree("libfoo-amd64", |dir, _ctx| {
                 fs::create_dir_all(dir.join("usr/lib/x86_64-linux-gnu"))?;

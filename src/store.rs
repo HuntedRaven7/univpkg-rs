@@ -3,12 +3,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Layout of the on-disk store:
-///
-///   $HOME/.local/unipkg/store/<sha256>-<name>
-///
-/// Each store path is content-addressed by a SHA-256 digest of its contents,
-/// plus a human-readable name, mirroring how Nix lays out `/nix/store`.
 const STORE_DIR: &str = "unipkg";
 const STORE_NAME: &str = "store";
 
@@ -19,7 +13,6 @@ pub struct StorePath {
 }
 
 impl StorePath {
-    /// Parse a `<sha256>-<name>` path component.
     pub fn parse(component: &str) -> Option<StorePath> {
         let (hash, name) = component.split_once('-')?;
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -31,7 +24,6 @@ impl StorePath {
         })
     }
 
-    /// Human-readable component, e.g. `hello-1.0`.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -49,15 +41,12 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (creating if necessary) the user store at
-    /// `$HOME/.local/unipkg/store`.
     pub fn init() -> io::Result<Store> {
         let base = Self::base_dir()?;
         fs::create_dir_all(&base)?;
         Ok(Store { base })
     }
 
-    /// Open an existing store, erroring if it has not been initialized.
     pub fn open() -> io::Result<Store> {
         let base = Self::base_dir()?;
         if !base.is_dir() {
@@ -72,24 +61,20 @@ impl Store {
         Ok(Store { base })
     }
 
-    /// Resolve `$HOME`, honoring the environment.
     pub fn home_dir() -> io::Result<PathBuf> {
         std::env::var("HOME")
             .map(PathBuf::from)
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "$HOME is not set"))
     }
 
-    /// `$HOME/.local/unipkg` — the parent of the store and state dirs.
     pub fn root() -> io::Result<PathBuf> {
         Ok(Self::home_dir()?.join(".local").join(STORE_DIR))
     }
 
-    /// Resolve the store base directory.
     fn base_dir() -> io::Result<PathBuf> {
         Ok(Self::root()?.join(STORE_NAME))
     }
 
-    /// `$HOME/.local/unipkg/state` — per-store-path link manifests.
     pub fn state_dir() -> io::Result<PathBuf> {
         Ok(Self::root()?.join("state"))
     }
@@ -98,7 +83,6 @@ impl Store {
         &self.base
     }
 
-    /// Store a blob of bytes under `<sha256>-<name>`, returning the store path.
     pub fn add(&self, bytes: &[u8], name: &str) -> io::Result<StorePath> {
         let hash = sha256_hex(bytes);
         let sp = StorePath {
@@ -109,8 +93,6 @@ impl Store {
         if dest.exists() {
             return Ok(sp);
         }
-        // Write to a temp sibling then rename, so partial writes never leak
-        // into the store under a committed name.
         let tmp = self.base.join(format!("{}.tmp{}", sp, std::process::id()));
         fs::write(&tmp, bytes)?;
         if let Err(e) = fs::rename(&tmp, &dest) {
@@ -120,13 +102,6 @@ impl Store {
         Ok(sp)
     }
 
-    /// Build a whole directory tree in the store. `populate` writes files
-    /// under the temp dir while feeding the payload bytes it writes into
-    /// `Sha256`; the resulting content hash becomes the store path name, so
-    /// identical payloads deduplicate regardless of how they were produced.
-    ///
-    /// Everything is staged in a sibling temp dir and atomically renamed, so a
-    /// partially extracted package never appears in the store.
     pub fn add_tree(
         &self,
         name: &str,
@@ -159,7 +134,6 @@ impl Store {
         Ok(sp)
     }
 
-    /// List every store path currently present.
     pub fn paths(&self) -> io::Result<Vec<StorePath>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.base)? {
@@ -188,7 +162,6 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex(&ctx.finalize())
 }
 
-/// Streaming SHA-256 (FIPS 180-4), dependency-free.
 pub struct Sha256 {
     h: [u32; 8],
     buf: [u8; 64],
@@ -326,7 +299,6 @@ impl Default for Sha256 {
     }
 }
 
-/// Wraps a `Read` and computes a SHA-256 digest of everything read.
 pub struct HashingReader<'a, R> {
     inner: R,
     ctx: &'a mut Sha256,
@@ -362,7 +334,6 @@ mod tests {
 
     #[test]
     fn sha256_known_vector() {
-        // "abc" -> ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"

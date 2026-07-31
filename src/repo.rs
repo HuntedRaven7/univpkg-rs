@@ -1,14 +1,6 @@
-//! Remote repositories: refresh Debian `Packages` indexes into a local cache
-//! and install packages by name, pulling in their `Depends` closure.
-//!
-//! The base system already provides a set of packages (glibc, the X11 stack,
-//! etc.) that we never download; see [`SYSTEM_PKGS`]. Everything else is
-//! installed into the store, so the store plus the base system together
-//! satisfy every dependency.
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use crate::deb::{self, DebMeta, Dep};
@@ -16,16 +8,12 @@ use crate::resolve;
 use crate::store::{sha256_hex, Store, StorePath};
 use crate::version;
 
-/// Components fetched for each repo architecture. Proprietary packages live in
-/// `non-free`; the Debian archive publishes all of these for every arch except
-/// where noted, and missing ones are skipped.
 const COMPONENTS: &[&str] = &["main", "contrib", "non-free", "non-free-firmware"];
 
 const DEFAULT_REPO_NAME: &str = "debian";
 const DEFAULT_REPO_BASE: &str = "http://deb.debian.org/debian";
 const DIST: &str = "stable";
 
-/// Architectures fetched by default when a repo does not list its own.
 const DEFAULT_ARCHES: &[&str] = &["amd64", "i386"];
 
 /// The architecture of the host we are running on, in Debian terminology.
@@ -38,8 +26,6 @@ pub fn host_arch() -> &'static str {
     }
 }
 
-/// Packages the base system is assumed to provide, so they never get
-/// downloaded into the store.
 const SYSTEM_PKGS: &[&str] = &[
     "libc6",
     "libgcc-s1",
@@ -114,7 +100,6 @@ const SYSTEM_PKGS: &[&str] = &[
 pub struct Repo {
     pub name: String,
     pub base: String,
-    /// Architectures whose `Packages` indexes are fetched into the cache.
     pub arches: Vec<String>,
 }
 
@@ -123,15 +108,11 @@ pub struct Package {
     pub package: String,
     pub version: String,
     pub architecture: String,
-    /// `Multi-Arch: foreign|same|allowed` from the index, if present.
     pub multi_arch: Option<String>,
     pub depends: Vec<Vec<Dep>>,
     pub filename: String,
     pub sha256: Option<String>,
-    /// One-line synopsis from the `Description` field.
     pub description: String,
-    /// Virtual package names this package `Provides` (arch qualifiers and
-    /// version restrictions stripped).
     pub provides: Vec<String>,
 }
 
@@ -154,9 +135,6 @@ impl Index {
         }
     }
 
-    /// Candidate packages for `name` that can satisfy a dependency from
-    /// architecture `arch`: packages built for `arch`, architecture-`all`
-    /// packages, and `Multi-Arch: foreign` packages of any architecture.
     fn candidates(&self, name: &str, arch: &str) -> Vec<Package> {
         self.by_name
             .get(name)
@@ -172,12 +150,8 @@ impl Index {
     }
 }
 
-/// Repos configured in `~/.local/unipkg/repos.conf`. Each line is
-/// `name <url> [arch...]` (`#` comments); with no arches the defaults
-/// ([`DEFAULT_ARCHES`]) are used. With no config, the Debian stable
-/// repository (amd64 + i386) is assumed.
 pub fn repos() -> io::Result<Vec<Repo>> {
-    let conf = Store::root()?.join("repos.conf");
+    let conf = Store::root()?.join("debrepos.conf");
     let mut out = Vec::new();
     if let Ok(text) = fs::read_to_string(&conf) {
         for line in text.lines() {
@@ -211,6 +185,25 @@ pub fn repos() -> io::Result<Vec<Repo>> {
     Ok(out)
 }
 
+pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
+    let conf = Store::root()?.join("debrepos.conf");
+    if let Some(parent) = conf.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let arches_part = if arches.is_empty() {
+        default_arches().join(" ")
+    } else {
+        arches.join(" ")
+    };
+    let line = format!("{name} {base} {arches_part}\n");
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&conf)?
+        .write_all(line.as_bytes())?;
+    Ok(())
+}
+
 fn default_arches() -> Vec<String> {
     DEFAULT_ARCHES.iter().map(|a| a.to_string()).collect()
 }
@@ -221,10 +214,6 @@ fn cache_path(repo: &Repo, arch: &str) -> io::Result<PathBuf> {
         .join(format!("{}.Packages.{arch}", repo.name)))
 }
 
-/// Fetch and cache the package indexes for a repo, one per architecture.
-/// Each architecture index is the merge of every published component
-/// ([`COMPONENTS`]); components the archive does not publish for an arch
-/// (404) are skipped.
 pub fn update(repo: &Repo) -> io::Result<usize> {
     let mut total = 0;
     for arch in &repo.arches {
@@ -242,8 +231,6 @@ pub fn update(repo: &Repo) -> io::Result<usize> {
                     total += sub.by_name.values().map(|v| v.len()).sum::<usize>();
                     index.merge(sub);
                 }
-                // A component can be absent for an arch (e.g. non-free-firmware
-                // for i386); that is not an error.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
@@ -365,7 +352,6 @@ fn parse_stanza(lines: &[&str]) -> Option<Package> {
     })
 }
 
-/// Parse a `Provides: a (= 1.2), b:any` field into bare names (`a`, `b`).
 fn parse_provides(field: &str) -> Vec<String> {
     let mut out = Vec::new();
     for item in field.split(',') {
@@ -421,9 +407,6 @@ fn render_index(index: &Index) -> String {
     out
 }
 
-/// Load the merged per-architecture indexes from the cache. Architectures the
-/// repo does not provide (or that have not been updated yet) are skipped; if
-/// no index is cached at all the caller is told to run `unipkg update`.
 fn read_index(repo: &Repo) -> io::Result<Index> {
     let mut index = Index::default();
     let mut missing = 0;
@@ -443,8 +426,6 @@ fn read_index(repo: &Repo) -> io::Result<Index> {
     Ok(index)
 }
 
-/// Search a repo's cached index for packages whose name or description
-/// contains `query` (case-insensitive), sorted by name then architecture.
 pub fn search(repo: &Repo, query: &str) -> Vec<Package> {
     let Ok(index) = read_index(repo) else {
         return Vec::new();
@@ -463,10 +444,6 @@ pub fn search(repo: &Repo, query: &str) -> Vec<Package> {
     out
 }
 
-/// Install `name` (plus its dependency closure) from a repo into the store,
-/// returning each newly installed package in install order (dependencies
-/// first). `name` may be arch-qualified (`libc6:i386`); unqualified names
-/// resolve to the host architecture.
 pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StorePath, DebMeta)>> {
     let index = read_index(repo)
         .map_err(|_| io::Error::other(format!("no index for repo '{}'; run `unipkg update`", repo.name)))?;
@@ -507,8 +484,6 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
     Ok(out)
 }
 
-/// Split a possibly arch-qualified package reference (`foo:i386`) into its
-/// name and optional architecture.
 fn split_name_arch(s: &str) -> (String, Option<String>) {
     match s.rsplit_once(':') {
         Some((name, arch)) => (name.to_string(), Some(arch.to_string())),
@@ -516,10 +491,6 @@ fn split_name_arch(s: &str) -> (String, Option<String>) {
     }
 }
 
-/// Plan the install closure for `name`, recursing into dependencies. `arch`
-/// is the architecture the dependency must be satisfied for (defaults to the
-/// host architecture). `planned` tracks `(name, architecture)` pairs so each
-/// instance is planned at most once.
 fn plan_package(
     installed: &[resolve::Installed],
     index: &Index,
@@ -531,9 +502,6 @@ fn plan_package(
 ) -> io::Result<()> {
     let desired = arch.map(str::to_owned).unwrap_or_else(|| host_arch().to_owned());
 
-    // Native (host-arch) system packages are provided by the base system.
-    // 32-bit instances must still be fetched, so the skip only applies to the
-    // host architecture.
     if SYSTEM_PKGS.contains(&name) && desired == host_arch() {
         planned.insert((name.to_string(), desired.to_string()));
         return Ok(());
@@ -554,7 +522,6 @@ fn plan_package(
             io::Error::other(format!("cannot satisfy dependency '{}'", name))
         })?;
 
-    // Mark in progress so dependency cycles terminate.
     let key = (candidate.package.clone(), candidate.architecture.clone());
     if !planned.insert(key) {
         return Ok(());
@@ -616,9 +583,6 @@ fn best_candidate(
         })
 }
 
-/// Best package that `Provides` the virtual package `name` (used when no real
-/// package is named `name`). Providers are sorted by version, then arch
-/// exactness, then name so the choice is deterministic.
 fn best_provider(
     index: &Index,
     name: &str,
@@ -646,8 +610,6 @@ fn best_provider(
     providers.pop()
 }
 
-/// Prefer a package built for the requested architecture (or `all`) over a
-/// `Multi-Arch: foreign` one when versions tie.
 fn exact_arch(p: &Package, arch: &str) -> u8 {
     if p.architecture == arch || p.architecture == "all" {
         1
@@ -666,8 +628,6 @@ fn constraint_ok(version: &str, c: Option<&(String, String)>) -> bool {
 fn http_get(url: &str) -> io::Result<Vec<u8>> {
     match ureq::get(url).call() {
         Ok(res) => res.into_body().read_to_vec().map_err(io::Error::other),
-        // 404 means a file does not exist (e.g. a component not published
-        // for an arch); callers skip those with ErrorKind::NotFound.
         Err(ureq::Error::StatusCode(404)) => {
             Err(io::Error::new(io::ErrorKind::NotFound, format!("{url}: not found")))
         }
@@ -749,7 +709,6 @@ mod tests {
             pkg("libc", "4.0", vec![]),
         ]);
         let names = plan(&idx, "app", None);
-        // deps before dependents
         assert_eq!(names, vec!["libc", "liba", "libb", "app"]);
     }
 
@@ -770,7 +729,6 @@ mod tests {
 
     #[test]
     fn alternative_group_falls_back() {
-        // liba exists but is unresolvable; libb works.
         let idx = index_of(vec![
             pkg("app", "1.0", vec![vec![Dep::package_only("liba"), Dep::package_only("libb")]]),
             pkg("libb", "3.0", vec![]),
@@ -780,7 +738,6 @@ mod tests {
 
     #[test]
     fn i386_instance_of_system_package_is_installed() {
-        // The host provides amd64 libc6, but an i386 build must be fetched.
         let idx = index_of(vec![
             pkg_arch("libc6", "2.40", "amd64", vec![]),
             pkg_arch("libc6", "2.40", "i386", vec![]),
@@ -788,7 +745,6 @@ mod tests {
         ]);
         let names = plan(&idx, "app", None);
         assert_eq!(names, vec!["libc6", "app"]);
-        // The planned libc6 instance must be the i386 one.
         let mut planned = HashSet::new();
         let mut out = Vec::new();
         plan_package(&[], &idx, "app", None, None, &mut out, &mut planned).unwrap();

@@ -13,8 +13,6 @@ pub struct DebMeta {
     pub description: String,
 }
 
-/// One dependency alternative: a package name plus an optional version
-/// constraint `(op version)` from the `Depends` field.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Dep {
     pub package: String,
@@ -22,7 +20,6 @@ pub struct Dep {
 }
 
 impl Dep {
-    /// A dependency with no version constraint.
     #[cfg(test)]
     pub fn package_only(name: &str) -> Dep {
         Dep {
@@ -32,13 +29,6 @@ impl Dep {
     }
 }
 
-/// Parse a `.deb` and install its payload into the store.
-///
-/// The `data.tar.*` member is unpacked into a store path
-/// `<sha256>-<package>-<version>`. Nothing is ever written outside the store:
-/// the `tar` crate sanitizes entry paths (absolute paths and `..` components
-/// cannot escape the destination), and extraction is staged in a temp dir
-/// that is atomically renamed in only once complete.
 pub fn install(store: &Store, deb: &[u8]) -> io::Result<(StorePath, DebMeta)> {
     if let Some((_, v)) = member(deb, "debian-binary")? {
         if String::from_utf8_lossy(&v).trim() != "2.0" {
@@ -70,7 +60,6 @@ pub fn install(store: &Store, deb: &[u8]) -> io::Result<(StorePath, DebMeta)> {
     Ok((sp, meta))
 }
 
-/// Read the `control` file out of the `control.tar.*` member.
 fn read_control(name: &str, bytes: &[u8]) -> io::Result<DebMeta> {
     let mut tar = tar::Archive::new(decompress(name, bytes)?);
     for entry in tar.entries()? {
@@ -85,9 +74,6 @@ fn read_control(name: &str, bytes: &[u8]) -> io::Result<DebMeta> {
     Err(invalid("control.tar has no `control` file"))
 }
 
-/// Extract `data.tar.*` into `dir`, feeding every decompressed byte into
-/// `ctx` so the store content hash covers the actual payload (independent of
-/// the compression format used by the package).
 fn unpack_data(
     name: &str,
     bytes: &[u8],
@@ -100,9 +86,6 @@ fn unpack_data(
     Ok(())
 }
 
-/// Open the decompressed payload as a reader. XZ is decompressed to a temp
-/// file first (lzma-rs is not streaming) so memory stays bounded on huge
-/// packages. The temp file is removed when the returned reader is dropped.
 fn open_payload<'a>(name: &str, bytes: &'a [u8]) -> io::Result<Box<dyn Read + 'a>> {
     let ext = name.rsplit('.').next().unwrap_or("");
     match ext {
@@ -139,7 +122,6 @@ fn open_payload<'a>(name: &str, bytes: &'a [u8]) -> io::Result<Box<dyn Read + 'a
     }
 }
 
-/// A `Read` over a temp file that removes the file on drop.
 struct TempFileReader {
     file: fs::File,
     path: std::path::PathBuf,
@@ -157,7 +139,6 @@ impl Drop for TempFileReader {
     }
 }
 
-/// Fully decompress a member (used for the small control archive).
 fn decompress<'a>(name: &str, bytes: &'a [u8]) -> io::Result<Box<dyn Read + 'a>> {
     let ext = name.rsplit('.').next().unwrap_or("");
     match ext {
@@ -179,8 +160,6 @@ fn decompress<'a>(name: &str, bytes: &'a [u8]) -> io::Result<Box<dyn Read + 'a>>
     }
 }
 
-/// Find the first ar member whose name starts with `prefix`.
-/// Returns `(name, contents)`.
 fn member(deb: &[u8], prefix: &str) -> io::Result<Option<(String, Vec<u8>)>> {
     let mut archive = ar::Archive::new(deb);
     while let Some(entry) = archive.next_entry() {
@@ -212,7 +191,6 @@ fn parse_control(text: &str) -> DebMeta {
     meta
 }
 
-/// Parse RFC822-style fields (`Key: value`, continuation lines indented).
 fn fields(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut cur: Option<(String, String)> = None;
@@ -233,9 +211,6 @@ fn fields(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Parse the Depends field: comma separates dependency groups, `|` separates
-/// alternatives within a group. Version constraints `name (op version)` are
-/// captured so resolution can pick a satisfying candidate.
 pub(crate) fn parse_depends(s: &str) -> Vec<Vec<Dep>> {
     s.split(',')
         .map(|group| {
@@ -267,7 +242,6 @@ pub(crate) fn parse_depends(s: &str) -> Vec<Vec<Dep>> {
         .collect()
 }
 
-/// Render a Depends structure back to its control-file representation.
 pub fn render_depends(groups: &[Vec<Dep>]) -> String {
     groups
         .iter()
@@ -288,8 +262,6 @@ pub fn render_depends(groups: &[Vec<Dep>]) -> String {
         .join(", ")
 }
 
-/// Persist package metadata next to the link manifest so the store path can
-/// be resolved (name, version, depends) even after linking.
 pub fn write_meta(meta: &DebMeta, sp: &StorePath) -> io::Result<()> {
     let dir = Store::state_dir()?.join(sp.to_string());
     fs::create_dir_all(&dir)?;
@@ -306,7 +278,6 @@ pub fn write_meta(meta: &DebMeta, sp: &StorePath) -> io::Result<()> {
     fs::write(dir.join("meta"), text)
 }
 
-/// Load persisted metadata for a store path, if present.
 pub fn read_meta(sp: &StorePath) -> io::Result<DebMeta> {
     let path = Store::state_dir()?.join(sp.to_string()).join("meta");
     let text = fs::read_to_string(&path)?;

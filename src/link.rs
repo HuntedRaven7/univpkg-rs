@@ -1,10 +1,3 @@
-//! User-facing integration for store paths: symlink executables into
-//! `~/.local/bin` and generate `.desktop` launcher entries so GUI apps show
-//! up in KDE/GNOME as "<Name> (univpkg)".
-//!
-//! Nothing here ever touches system directories: every artifact lands under
-//! `$HOME/.local`, and existing files we do not own are never clobbered.
-
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -17,7 +10,6 @@ use crate::deb::DebMeta;
 use crate::resolve;
 use crate::store::{Store, StorePath};
 
-/// Relative bin directories scanned inside a store path.
 const BIN_DIRS: &[&str] = &[
     "usr/bin",
     "usr/sbin",
@@ -32,16 +24,11 @@ const DESKTOP_SUFFIX: &str = " (univpkg)";
 
 #[derive(Clone, Debug, Default)]
 pub struct Linked {
-    /// `$HOME/.local/bin` symlinks created, in order.
     pub bin_links: Vec<PathBuf>,
-    /// `.desktop` files written under `$HOME/.local/share/applications`.
     pub desktop_files: Vec<PathBuf>,
-    /// Icon files copied under `$HOME/.local/share/{icons,pixmaps}`.
     pub icons: Vec<PathBuf>,
 }
 
-/// Make a store path usable from the desktop: link its executables onto
-/// `$HOME/.local/bin` and publish `.desktop` launchers for GUI apps.
 pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result<Linked> {
     let home = Store::home_dir()?;
     let store_path = store.base().join(sp.to_string());
@@ -56,8 +43,6 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
     let mut linked = Linked::default();
     let mut manifest: Vec<(char, PathBuf, PathBuf)> = Vec::new();
     let installed = resolve::installed_packages(store);
-    // bin name -> wrapper path, for binaries that need store libs on
-    // LD_LIBRARY_PATH. Desktop Exec lines are pointed at these.
     let mut wrapped: HashMap<String, PathBuf> = HashMap::new();
 
     for src in find_binaries(&store_path)? {
@@ -143,9 +128,6 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
     Ok(linked)
 }
 
-/// Refresh the desktop-environment caches so new launchers show up right away
-/// in GNOME, KDE and other DEs. Best-effort: the tools ship with their
-/// respective desktops and may be absent; each failure is ignored.
 fn refresh_desktop_db(apps_dir: &Path) {
     for tool in ["update-desktop-database", "kbuildsycoca6", "kbuildsycoca5"] {
         let arg: &OsStr = if tool == "update-desktop-database" {
@@ -165,9 +147,6 @@ fn refresh_desktop_db(apps_dir: &Path) {
     }
 }
 
-/// Remove every artifact a package's manifest records, then drop the
-/// manifest. Store paths themselves are left untouched. `package` may be
-/// arch-qualified (`libc6:i386`) to target one architecture.
 pub fn unlink(package: &str) -> io::Result<usize> {
     let state = Store::state_dir()?;
     let (pkg, arch) = match package.rsplit_once(':') {
@@ -209,11 +188,6 @@ pub fn unlink(package: &str) -> io::Result<usize> {
     Ok(removed)
 }
 
-/// Remove a package entirely: launcher artifacts, its manifest, and its store
-/// path. Unlike [`unlink`] this also frees the store contents. A warning is
-/// emitted (but the uninstall proceeds) when another installed package still
-/// declares a dependency on the removed package. Returns
-/// `(links_removed, store_paths_removed)`.
 pub fn uninstall(package: &str) -> io::Result<(usize, usize)> {
     let (pkg, arch) = match package.rsplit_once(':') {
         Some((p, a)) => (p, Some(a)),
@@ -223,8 +197,6 @@ pub fn uninstall(package: &str) -> io::Result<(usize, usize)> {
     let store = Store::open()?;
     let installed = crate::resolve::installed_packages(&store);
 
-    // Resolve the target store paths up front: `unlink` below wipes the state
-    // dirs (and with them the `meta` file the arch filter needs).
     let targets: Vec<StorePath> = store
         .paths()?
         .into_iter()
@@ -277,8 +249,6 @@ pub fn uninstall(package: &str) -> io::Result<(usize, usize)> {
     Ok((linked, removed))
 }
 
-/// Delete the artifacts a store path's manifest records, keeping the
-/// manifest and state dir (used when re-linking a package).
 pub fn remove_artifacts(sp: &StorePath) -> io::Result<usize> {
     let manifest = Store::state_dir()?.join(sp.to_string()).join("links");
     let mut removed = 0;
@@ -299,9 +269,6 @@ pub fn remove_artifacts(sp: &StorePath) -> io::Result<usize> {
     Ok(removed)
 }
 
-/// Write a `.desktop` file so desktop environments pick it up: it must be
-/// executable (GNOME hides non-executable `.desktop` files from the launcher)
-/// and end with a newline.
 fn write_desktop(dest: &Path, text: &str) -> io::Result<()> {
     let mut text = text.to_string();
     if !text.ends_with('\n') {
@@ -311,8 +278,6 @@ fn write_desktop(dest: &Path, text: &str) -> io::Result<()> {
     fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
 }
 
-/// Write a `~/.local/bin` wrapper that puts the store's shared libraries on
-/// `LD_LIBRARY_PATH` before exec'ing the real store binary.
 fn write_wrapper(dest: &Path, target: &Path, dirs: &[PathBuf]) -> io::Result<()> {
     let ld = dirs
         .iter()
@@ -377,9 +342,6 @@ struct IconCopy {
     dest: PathBuf,
 }
 
-/// Rewrite a `.desktop` file so it points at the store: the command is
-/// rewired to the store path (or its launcher wrapper), the display name is
-/// suffixed with `(univpkg)`, and icons are copied into the user's dirs.
 fn rewrite_desktop(
     text: &str,
     store_path: &Path,
@@ -416,9 +378,6 @@ fn rewrite_desktop(
     (rewritten, copies)
 }
 
-/// Rewrite a desktop Exec command. Commands that are wrapped (because they
-/// need store libs on `LD_LIBRARY_PATH`) point at the wrapper; everything
-/// else is rewired to its store path when it lives there.
 fn rewrite_exec(
     value: &str,
     store_path: &Path,
@@ -509,8 +468,6 @@ fn rewrite_icon(
     (value.to_string(), copies)
 }
 
-/// Locate every icon named `name` inside the store (both theme icons and
-/// pixmaps) and compute where each should land in the user's dirs.
 fn find_icon_files(
     store_path: &Path,
     name: &str,
@@ -577,7 +534,6 @@ fn copy_icon_file(source: &Path, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Persist what `link_package` created so `unlink` can undo it.
 fn write_manifest(sp: &StorePath, entries: &[(char, PathBuf, PathBuf)]) -> io::Result<()> {
     let dir = Store::state_dir()?.join(sp.to_string());
     fs::create_dir_all(&dir)?;
@@ -711,7 +667,6 @@ mod tests {
     #[test]
     fn uninstall_removes_store_path() {
         with_env("uninstall", |_store, home| {
-            // uninstall resolves the store from $HOME, so use the real one.
             let store = Store::init().unwrap();
             let sp = sp();
             fake_store_path(&store, &sp);
