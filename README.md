@@ -19,6 +19,31 @@
   `~/.local/share/pixmaps` so installed apps show up in a normal desktop
   environment.
 
+## Goals
+
+core
+  - dependency resolution (with conflict detection)
+  - reproducible/deterministic installs (lockfile)
+  - transactional installs (atomic, rollback on failure)
+  - signature verification for packages/repos
+
+quality of life
+  - parallel downloads
+  - delta updates (only fetch diffs)
+  - search with fuzzy matching
+  - clean orphan/unused dependency removal
+
+advanced
+  - sandboxed builds (containers or namespaces)
+  - multiple repo/mirror support with priority
+  - binary + source package support
+  - hooks (pre/post install scripts)
+  - offline/local repo caching
+
+nice-to-have
+  - a TUI for browsing/searching packages
+  - integration with existing formats (so it's not a total island)
+
 ## Usage
 
 ```
