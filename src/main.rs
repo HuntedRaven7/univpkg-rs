@@ -40,20 +40,45 @@ fn main() -> ExitCode {
 
     match command {
         "--store" | "store" => run_store(),
-        "init" => match store::Store::init() {
-            Ok(s) => {
-                println!(
-                    "{} {}",
-                    term::bold_green("initialized"),
-                    term::cyan(&format!("store at {}", s.base().display()))
-                );
-                ExitCode::SUCCESS
+        "init" => {
+            let result: io::Result<store::Store> = (|| {
+                let s = store::Store::init()?;
+                repo::ensure_default_repo()?;
+                rpmrepo::ensure_default_repo()?;
+                Ok(s)
+            })();
+            match result {
+                Ok(s) => {
+                    println!(
+                        "{} {}",
+                        term::bold_green("initialized"),
+                        term::cyan(&format!("store at {}", s.base().display()))
+                    );
+                    println!("{}", term::bold("configured repos:"));
+                    for r in repo::repos().unwrap_or_default() {
+                        println!(
+                            "  {} {} {}",
+                            term::bold_cyan(&r.name),
+                            term::dim("->"),
+                            term::cyan(&r.base)
+                        );
+                    }
+                    for r in rpmrepo::repos().unwrap_or_default() {
+                        println!(
+                            "  {} {} {}",
+                            term::bold_cyan(&r.name),
+                            term::dim("->"),
+                            term::cyan(&r.base)
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    ExitCode::FAILURE
+                }
             }
-            Err(e) => {
-                eprintln!("{}", term::error(&e.to_string()));
-                ExitCode::FAILURE
-            }
-        },
+        }
         "status" => match store::Store::open() {
             Ok(s) => {
                 println!(
@@ -462,6 +487,25 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        "autoclean" => match link::autoclean() {
+            Ok(orphans) => {
+                if orphans.is_empty() {
+                    println!("{}", term::dim("nothing to clean"));
+                } else {
+                    println!(
+                        "{} {} ({})",
+                        term::bold_green("removed"),
+                        orphans.join(", "),
+                        term::dim(&format!("{} orphaned", orphans.len()))
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", term::error(&e.to_string()));
+                ExitCode::FAILURE
+            }
+        },
         "uninstall" => {
             let package = match args.get(1) {
                 Some(p) => p,
@@ -597,7 +641,7 @@ fn print_help() {
     println!("usage: univ <command> [args]");
     println!();
     println!("commands:");
-    println!("  init                    create the store at ~/.local/univ");
+    println!("  init                    create the store at ~/.local/univ (with default deb & rpm repos)");
     println!("  store (or --store)      open the interactive store TUI (univ-store)");
     println!("  status                  list installed store paths");
     println!("  list                    list installed packages (add --json for machine-readable)");
@@ -623,6 +667,7 @@ fn print_help() {
     println!("  unlink <package>        remove a package's launchers and desktop entries");
     println!("  uninstall <package>     remove a package's files, launchers and store path");
     println!("                          (plus no-longer-needed dependencies)");
+    println!("  autoclean               remove orphaned dependency packages");
 }
 
 fn report_linked(linked: &link::Linked) {

@@ -184,6 +184,21 @@ pub fn repos() -> io::Result<Vec<Repo>> {
     Ok(out)
 }
 
+pub fn ensure_default_repo() -> io::Result<()> {
+    let conf = Store::root()?.join("debrepos.conf");
+    if conf.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = conf.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let line = format!(
+        "{DEFAULT_REPO_NAME} {DEFAULT_REPO_BASE} {}\n",
+        default_arches().join(" ")
+    );
+    fs::write(&conf, line)
+}
+
 pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
     let conf = Store::root()?.join("debrepos.conf");
     if let Some(parent) = conf.parent() {
@@ -465,30 +480,31 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
     )?;
 
     let mut out = Vec::new();
-    for (i, pkg) in plan.iter().enumerate() {
-        let label = format!(
-            "downloading {}-{} [{}]",
-            pkg.package, pkg.version, pkg.architecture
-        );
-        let url = format!("{}/{}", repo.base, pkg.filename);
-        let bytes = crate::term::http_get(&url, &label, None)?;
-        if let Some(expected) = &pkg.sha256 {
-            let got = sha256_hex(&bytes);
-            if !got.eq_ignore_ascii_case(expected) {
-                return Err(io::Error::other(format!(
-                    "checksum mismatch for {}: expected {expected}, got {got}",
-                    pkg.filename
-                )));
+    if !plan.is_empty() {
+        let urls: Vec<String> = plan
+            .iter()
+            .map(|pkg| format!("{}/{}", repo.base, pkg.filename))
+            .collect();
+        let downloaded = crate::term::http_get_many(&urls, None)?;
+        for (i, (pkg, bytes)) in plan.iter().zip(downloaded.iter()).enumerate() {
+            if let Some(expected) = &pkg.sha256 {
+                let got = sha256_hex(bytes);
+                if !got.eq_ignore_ascii_case(expected) {
+                    return Err(io::Error::other(format!(
+                        "checksum mismatch for {}: expected {expected}, got {got}",
+                        pkg.filename
+                    )));
+                }
             }
+            let (sp, meta) = deb::install(store, bytes)?;
+            deb::write_meta(&meta, &sp)?;
+            if i + 1 == plan.len() {
+                crate::store::mark_manual(&sp)?;
+            } else {
+                crate::store::mark_auto(&sp)?;
+            }
+            out.push((sp, meta));
         }
-        let (sp, meta) = deb::install(store, &bytes)?;
-        deb::write_meta(&meta, &sp)?;
-        if i + 1 == plan.len() {
-            crate::store::mark_manual(&sp)?;
-        } else {
-            crate::store::mark_auto(&sp)?;
-        }
-        out.push((sp, meta));
     }
     if out.is_empty()
         && let Some(p) = installed

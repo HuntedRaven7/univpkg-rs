@@ -220,3 +220,73 @@ pub fn http_get(url: &str, label: &str, max: Option<u64>) -> io::Result<Vec<u8>>
     progress.finish();
     Ok(buf)
 }
+
+pub fn http_get_many(urls: &[String], max: Option<u64>) -> io::Result<Vec<Vec<u8>>> {
+    use std::sync::{Arc, Mutex};
+
+    type Results = Arc<Mutex<Vec<Option<io::Result<Vec<u8>>>>>>;
+
+    let label = format!("downloading {} package(s)", urls.len());
+    let progress = Arc::new(Mutex::new(Progress::new(label, None)));
+    let results: Results =
+        Arc::new(Mutex::new((0..urls.len()).map(|_| None).collect()));
+
+    let mut handles = Vec::new();
+    for (i, url) in urls.iter().enumerate() {
+        let url = url.clone();
+        let progress = Arc::clone(&progress);
+        let results = Arc::clone(&results);
+        handles.push(std::thread::spawn(move || {
+            let mut res = match ureq::get(&url).call() {
+                Ok(r) => r,
+                Err(ureq::Error::StatusCode(404)) => {
+                    results.lock().unwrap()[i] = Some(Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{url}: not found"),
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    results.lock().unwrap()[i] =
+                        Some(Err(io::Error::other(format!("{url}: {e}"))));
+                    return;
+                }
+            };
+            let mut reader = res
+                .body_mut()
+                .with_config()
+                .limit(max.unwrap_or(u64::MAX))
+                .reader();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                let n = match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        results.lock().unwrap()[i] =
+                            Some(Err(io::Error::other(format!("{url}: {e}"))));
+                        return;
+                    }
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                progress.lock().unwrap().advance(n as u64);
+            }
+            results.lock().unwrap()[i] = Some(Ok(buf));
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    progress.lock().unwrap().finish();
+
+    let mut locked = results.lock().unwrap();
+    let mut out = Vec::with_capacity(urls.len());
+    for slot in locked.iter_mut() {
+        out.push(
+            slot.take()
+                .ok_or_else(|| io::Error::other("download thread panicked"))??,
+        );
+    }
+    Ok(out)
+}
