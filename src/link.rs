@@ -202,6 +202,7 @@ fn required_by(installed: &[crate::resolve::Installed], name: &str) -> Vec<Strin
 
 fn remove_orphans(store: &Store) -> Vec<String> {
     let mut removed = Vec::new();
+    let mut lock = crate::lock::Lockfile::load();
     loop {
         let installed = crate::resolve::installed_packages(store);
         let orphan = installed.iter().find(|p| {
@@ -213,13 +214,16 @@ fn remove_orphans(store: &Store) -> Vec<String> {
         };
         let sp = orphan.sp.clone();
         let name = orphan.meta.package.clone();
+        let arch = orphan.meta.architecture.clone();
         let _ = remove_artifacts(&sp);
         if let Ok(state) = Store::state_dir() {
             let _ = fs::remove_dir_all(state.join(sp.to_string()));
         }
         let _ = fs::remove_dir_all(store.base().join(sp.to_string()));
+        lock.remove(&name, &arch);
         removed.push(name);
     }
+    let _ = lock.save();
     removed
 }
 
@@ -257,6 +261,7 @@ pub fn uninstall(package: &str) -> io::Result<(usize, usize, Vec<String>)> {
 
     let linked = unlink(package).unwrap_or_default();
 
+    let mut lock = crate::lock::Lockfile::load();
     let mut removed = 0;
     for sp in &targets {
         let still_needed: Vec<String> = installed
@@ -276,9 +281,13 @@ pub fn uninstall(package: &str) -> io::Result<(usize, usize, Vec<String>)> {
                 still_needed.join(", ")
             );
         }
+        if let Some(p) = installed.iter().find(|p| p.sp == *sp) {
+            lock.remove(&p.meta.package, &p.meta.architecture);
+        }
         fs::remove_dir_all(store.base().join(sp.to_string()))?;
         removed += 1;
     }
+    let _ = lock.save();
 
     let orphans = remove_orphans(&store);
 

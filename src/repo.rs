@@ -464,6 +464,7 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
     let index = read_index(repo)
         .map_err(|_| io::Error::other(format!("no index for repo '{}'; run `univ update`", repo.name)))?;
     let installed = resolve::installed_packages(store);
+    let mut lock = crate::lock::Lockfile::load();
 
     let (pkg_name, pkg_arch) = split_name_arch(name);
 
@@ -475,6 +476,7 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
         &pkg_name,
         pkg_arch.as_deref(),
         None,
+        Some(&lock),
         &mut plan,
         &mut planned,
     )?;
@@ -503,8 +505,20 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
             } else {
                 crate::store::mark_auto(&sp)?;
             }
+            lock.set(crate::lock::LockEntry {
+                package: pkg.package.clone(),
+                version: pkg.version.clone(),
+                architecture: pkg.architecture.clone(),
+                sha256: pkg
+                    .sha256
+                    .clone()
+                    .unwrap_or_else(|| sha256_hex(bytes)),
+                base: repo.base.clone(),
+                kind: "deb".to_string(),
+            });
             out.push((sp, meta));
         }
+        lock.save()?;
     }
     if out.is_empty()
         && let Some(p) = installed
@@ -523,12 +537,14 @@ fn split_name_arch(s: &str) -> (String, Option<String>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_package(
     installed: &[resolve::Installed],
     index: &Index,
     name: &str,
     arch: Option<&str>,
     constraint: Option<&(String, String)>,
+    locked: Option<&crate::lock::Lockfile>,
     plan: &mut Vec<Package>,
     planned: &mut HashSet<(String, String)>,
 ) -> io::Result<()> {
@@ -548,7 +564,8 @@ fn plan_package(
         return Ok(());
     }
 
-    let candidate = best_candidate(index, name, &desired, constraint)
+    let candidate = locked_candidate(index, locked, name, &desired, constraint)
+        .or_else(|| best_candidate(index, name, &desired, constraint))
         .or_else(|| best_provider(index, name, &desired, constraint))
         .ok_or_else(|| {
             io::Error::other(format!("cannot satisfy dependency '{}'", name))
@@ -578,6 +595,7 @@ fn plan_package(
                 &alt_name,
                 Some(&dep_arch),
                 alt.version.as_ref(),
+                locked,
                 &mut sub_plan,
                 &mut sub_planned,
             ) {
@@ -597,6 +615,22 @@ fn plan_package(
 
     plan.push(candidate);
     Ok(())
+}
+
+fn locked_candidate(
+    index: &Index,
+    locked: Option<&crate::lock::Lockfile>,
+    name: &str,
+    arch: &str,
+    constraint: Option<&(String, String)>,
+) -> Option<Package> {
+    let entry = locked?
+        .get(name, arch)
+        .or_else(|| locked?.get(name, "all"))?;
+    index
+        .candidates(name, arch)
+        .into_iter()
+        .find(|p| p.version == entry.version && constraint_ok(&p.version, constraint))
 }
 
 fn best_candidate(
@@ -695,7 +729,7 @@ mod tests {
     fn plan(idx: &Index, name: &str, arch: Option<&str>) -> Vec<String> {
         let mut plan = Vec::new();
         let mut planned = HashSet::new();
-        plan_package(&[], idx, name, arch, None, &mut plan, &mut planned).unwrap();
+        plan_package(&[], idx, name, arch, None, None, &mut plan, &mut planned).unwrap();
         plan.iter().map(|p| p.package.clone()).collect()
     }
 
@@ -744,7 +778,7 @@ mod tests {
         let idx = index_of(vec![pkg("app", "1.0", vec![vec![Dep::package_only("ghost")]])]);
         let mut plan = Vec::new();
         let mut planned = HashSet::new();
-        let err = plan_package(&[], &idx, "app", None, None, &mut plan, &mut planned);
+        let err = plan_package(&[], &idx, "app", None, None, None, &mut plan, &mut planned);
         assert!(err.is_err());
     }
 
@@ -768,7 +802,7 @@ mod tests {
         assert_eq!(names, vec!["libc6", "app"]);
         let mut planned = HashSet::new();
         let mut out = Vec::new();
-        plan_package(&[], &idx, "app", None, None, &mut out, &mut planned).unwrap();
+        plan_package(&[], &idx, "app", None, None, None, &mut out, &mut planned).unwrap();
         let libc6 = out.iter().find(|p| p.package == "libc6").unwrap();
         assert_eq!(libc6.architecture, "i386");
     }
@@ -782,7 +816,7 @@ mod tests {
         ]);
         let mut planned = HashSet::new();
         let mut out = Vec::new();
-        plan_package(&[], &idx, "app", Some("i386"), None, &mut out, &mut planned).unwrap();
+        plan_package(&[], &idx, "app", Some("i386"), None, None, &mut out, &mut planned).unwrap();
         let libgl1 = out.iter().find(|p| p.package == "libgl1").unwrap();
         assert_eq!(libgl1.architecture, "i386");
     }
@@ -826,6 +860,45 @@ mod tests {
         ]);
         let names = plan(&idx, "app", None);
         assert_eq!(names, vec!["virt", "app"]);
+    }
+
+    #[test]
+    fn locked_version_wins_over_newer() {
+        let idx = index_of(vec![
+            pkg("foo", "1.0", vec![]),
+            pkg("foo", "2.0", vec![]),
+        ]);
+        let mut lock = crate::lock::Lockfile::default();
+        lock.set(crate::lock::LockEntry {
+            package: "foo".into(),
+            version: "1.0".into(),
+            architecture: "all".into(),
+            sha256: "deadbeef".into(),
+            base: "http://example.invalid".into(),
+            kind: "deb".into(),
+        });
+        let mut plan = Vec::new();
+        let mut planned = HashSet::new();
+        plan_package(&[], &idx, "foo", None, None, Some(&lock), &mut plan, &mut planned).unwrap();
+        assert_eq!(plan[0].version, "1.0");
+    }
+
+    #[test]
+    fn stale_lock_falls_back_to_newest() {
+        let idx = index_of(vec![pkg("foo", "2.0", vec![])]);
+        let mut lock = crate::lock::Lockfile::default();
+        lock.set(crate::lock::LockEntry {
+            package: "foo".into(),
+            version: "1.0".into(),
+            architecture: "all".into(),
+            sha256: "deadbeef".into(),
+            base: "http://example.invalid".into(),
+            kind: "deb".into(),
+        });
+        let mut plan = Vec::new();
+        let mut planned = HashSet::new();
+        plan_package(&[], &idx, "foo", None, None, Some(&lock), &mut plan, &mut planned).unwrap();
+        assert_eq!(plan[0].version, "2.0");
     }
 
     #[test]

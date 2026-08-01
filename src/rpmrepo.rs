@@ -548,10 +548,20 @@ pub fn install(
         ))
     })?;
     let installed = resolve::installed_packages(store);
+    let mut lock = crate::lock::Lockfile::load();
 
     let mut plan: Vec<RpmPackage> = Vec::new();
     let mut planned: HashSet<(String, String)> = HashSet::new();
-    plan_package(&installed, &index, name, None, None, &mut plan, &mut planned)?;
+    plan_package(
+        &installed,
+        &index,
+        name,
+        None,
+        None,
+        Some(&lock),
+        &mut plan,
+        &mut planned,
+    )?;
 
     let mut out = Vec::new();
     if !plan.is_empty() {
@@ -584,9 +594,21 @@ pub fn install(
             } else {
                 crate::store::mark_auto(&sp)?;
             }
+            lock.set(crate::lock::LockEntry {
+                package: pkg.package.clone(),
+                version: pkg.full_version.clone(),
+                architecture: pkg.architecture.clone(),
+                sha256: pkg
+                    .sha256
+                    .clone()
+                    .unwrap_or_else(|| sha256_hex(bytes)),
+                base: repo.base.clone(),
+                kind: "rpm".to_string(),
+            });
             let deb_meta: DebMeta = rpm_meta.into();
             out.push((sp, deb_meta));
         }
+        lock.save()?;
     }
     if out.is_empty()
         && let Some(p) = installed.iter().find(|p| p.meta.package == name)
@@ -596,12 +618,14 @@ pub fn install(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_package(
     installed: &[resolve::Installed],
     index: &Index,
     name: &str,
     arch: Option<&str>,
     constraint: Option<&(String, String)>,
+    locked: Option<&crate::lock::Lockfile>,
     plan: &mut Vec<RpmPackage>,
     planned: &mut HashSet<(String, String)>,
 ) -> io::Result<()> {
@@ -623,9 +647,11 @@ fn plan_package(
         return Ok(());
     }
 
-    let candidate = best_candidate(index, name, &desired, constraint).ok_or_else(|| {
-        io::Error::other(format!("cannot satisfy dependency '{name}'"))
-    })?;
+    let candidate = locked_candidate(index, locked, name, &desired, constraint)
+        .or_else(|| best_candidate(index, name, &desired, constraint))
+        .ok_or_else(|| {
+            io::Error::other(format!("cannot satisfy dependency '{name}'"))
+        })?;
 
     let key = (candidate.package.clone(), candidate.architecture.clone());
     if !planned.insert(key) {
@@ -644,6 +670,7 @@ fn plan_package(
                 &alt.package,
                 Some(&dep_arch),
                 alt.version.as_ref(),
+                locked,
                 &mut sub_plan,
                 &mut sub_planned,
             ) {
@@ -663,6 +690,24 @@ fn plan_package(
 
     plan.push(candidate);
     Ok(())
+}
+
+fn locked_candidate(
+    index: &Index,
+    locked: Option<&crate::lock::Lockfile>,
+    name: &str,
+    arch: &str,
+    constraint: Option<&(String, String)>,
+) -> Option<RpmPackage> {
+    let entry = locked?
+        .get(name, arch)
+        .or_else(|| locked?.get(name, "noarch"))?;
+    index
+        .candidates(name, arch)
+        .into_iter()
+        .find(|p| {
+            p.full_version == entry.version && constraint_ok(&p.full_version, constraint)
+        })
 }
 
 fn best_candidate(
@@ -745,7 +790,7 @@ mod tests {
     fn plan_names(index: &Index, name: &str) -> Vec<String> {
         let mut plan = Vec::new();
         let mut planned = HashSet::new();
-        plan_package(&[], index, name, None, None, &mut plan, &mut planned).unwrap();
+        plan_package(&[], index, name, None, None, None, &mut plan, &mut planned).unwrap();
         plan.iter().map(|p| p.package.clone()).collect()
     }
 
@@ -789,7 +834,7 @@ mod tests {
         let index = idx(vec![pkg("app", "1.0", vec![vec![RpmDep::package_only("ghost")]])]);
         let mut plan = Vec::new();
         let mut planned = HashSet::new();
-        let err = plan_package(&[], &index, "app", None, None, &mut plan, &mut planned);
+        let err = plan_package(&[], &index, "app", None, None, None, &mut plan, &mut planned);
         assert!(err.is_err());
     }
 

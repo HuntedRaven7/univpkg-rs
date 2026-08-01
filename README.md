@@ -76,7 +76,18 @@ univ unlink <package>          remove a package's launchers and desktop entries
 univ uninstall <package>       remove a package's files, launchers and store path
                                (plus any no-longer-needed dependencies)
 univ autoclean                 remove all orphaned dependency packages
+univ lock                      show the pinned package versions (lock.json)
 ```
+
+## Lockfile
+
+`~/.local/univ/lock.json` pins the exact version, architecture, sha256 and
+source repo of every installed package, like a Nix lockfile. `univ install`
+prefers locked versions over the newest available in the index, so re-resolving
+a closure after the store was cleared gives you the exact same packages.
+The lock is kept in sync automatically: installs add the resolved plan, and
+`univ uninstall` / `univ autoclean` drop the entries they remove. Use
+`univ lock` (or `univ lock --json`) to inspect it.
 
 ## TUI store manager
 

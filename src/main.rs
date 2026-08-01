@@ -1,6 +1,7 @@
 mod deb;
 mod elf;
 mod link;
+mod lock;
 mod repo;
 mod resolve;
 mod rpm;
@@ -487,6 +488,45 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        "lock" => {
+            let lock = lock::Lockfile::load();
+            if json {
+                let rows: Vec<serde_json::Value> = lock
+                    .entries()
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.package,
+                            "version": e.version,
+                            "architecture": e.architecture,
+                            "sha256": e.sha256,
+                            "repo": e.base,
+                            "kind": e.kind,
+                        })
+                    })
+                    .collect();
+                let out =
+                    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+                println!("{out}");
+            } else if lock.is_empty() {
+                println!("{}", term::dim("no packages locked"));
+            } else {
+                for e in lock.entries() {
+                    let short = &e.sha256[..e.sha256.len().min(16)];
+                    println!(
+                        "{} {}-{} [{}] {}  {}  {}",
+                        term::bold_cyan(&e.package),
+                        term::green(&e.version),
+                        term::magenta(&e.architecture),
+                        term::magenta(&e.kind),
+                        term::dim(&e.base),
+                        term::dim(short),
+                        term::dim("(lock.json)")
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
         "autoclean" => match link::autoclean() {
             Ok(orphans) => {
                 if orphans.is_empty() {
@@ -668,6 +708,7 @@ fn print_help() {
     println!("  uninstall <package>     remove a package's files, launchers and store path");
     println!("                          (plus no-longer-needed dependencies)");
     println!("  autoclean               remove orphaned dependency packages");
+    println!("  lock                    show the pinned package versions (lock.json)");
 }
 
 fn report_linked(linked: &link::Linked) {
@@ -716,6 +757,16 @@ fn install_deb_file(file: &str) -> ExitCode {
         let (p, meta) = deb::install(&s, &bytes)?;
         deb::write_meta(&meta, &p)?;
         store::mark_manual(&p)?;
+        let mut lock = lock::Lockfile::load();
+        lock.set(lock::LockEntry {
+            package: meta.package.clone(),
+            version: meta.version.clone(),
+            architecture: meta.architecture.clone(),
+            sha256: store::sha256_hex(&bytes),
+            base: format!("file:{file}"),
+            kind: "deb".to_string(),
+        });
+        lock.save()?;
         Ok((s, p, meta))
     }) {
         Ok((s, p, meta)) => {
@@ -762,6 +813,16 @@ fn install_rpm_file(file: &str) -> ExitCode {
         rpm::write_meta(&rpm_meta, &p)?;
         let meta: deb::DebMeta = rpm_meta.into();
         store::mark_manual(&p)?;
+        let mut lock = lock::Lockfile::load();
+        lock.set(lock::LockEntry {
+            package: meta.package.clone(),
+            version: meta.version.clone(),
+            architecture: meta.architecture.clone(),
+            sha256: store::sha256_hex(&bytes),
+            base: format!("file:{file}"),
+            kind: "rpm".to_string(),
+        });
+        lock.save()?;
         Ok((s, p, meta))
     }) {
         Ok((s, p, meta)) => {
