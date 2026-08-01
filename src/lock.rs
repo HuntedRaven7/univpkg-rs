@@ -16,7 +16,7 @@ pub struct LockEntry {
     pub kind: String,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Lockfile {
     packages: HashMap<String, LockEntry>,

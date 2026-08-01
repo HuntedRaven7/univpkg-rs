@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 const STORE_DIR: &str = "univ";
 const STORE_NAME: &str = "store";
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StorePath {
     hash: String,
     name: String,

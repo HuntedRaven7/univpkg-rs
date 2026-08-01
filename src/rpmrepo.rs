@@ -222,7 +222,28 @@ pub fn update(repo: &FedoraRepo) -> io::Result<usize> {
     for arch in &repo.arches {
         let base = repo.base.trim_end_matches('/');
         let repomd_url = format!("{base}/repodata/repomd.xml");
-        let repomd_bytes = crate::term::http_get(&repomd_url, "repomd.xml", Some(MAX_BODY))?;
+        let cache_file = cache_path(repo, arch)?;
+        let meta_file = Store::root()?
+            .join("cache")
+            .join(format!("{}.repomd.{arch}.meta", repo.name));
+        let validators = crate::term::load_validators(&meta_file);
+
+        let outcome = crate::term::http_get_conditional(
+            &repomd_url,
+            "repomd.xml",
+            Some(MAX_BODY),
+            &validators,
+        )?;
+        let repomd_bytes = match outcome {
+            crate::term::FetchOutcome::NotModified if cache_file.exists() => continue,
+            crate::term::FetchOutcome::NotModified => {
+                crate::term::http_get(&repomd_url, "repomd.xml", Some(MAX_BODY))?
+            }
+            crate::term::FetchOutcome::Modified(bytes, new_validators) => {
+                crate::term::save_validators(&meta_file, &new_validators)?;
+                bytes
+            }
+        };
         let repomd_text =
             String::from_utf8(repomd_bytes).map_err(io::Error::other)?;
 
@@ -517,6 +538,28 @@ pub fn search(repo: &FedoraRepo, query: &str) -> Vec<RpmPackage> {
     out
 }
 
+pub fn available_names() -> Vec<String> {
+    let mut names: HashSet<String> = HashSet::new();
+    if let Ok(repos) = repos() {
+        for r in &repos {
+            if let Ok(index) = read_index(r) {
+                names.extend(index.by_name.keys().cloned());
+            }
+        }
+    }
+    let mut v: Vec<String> = names.into_iter().collect();
+    v.sort();
+    v
+}
+
+pub fn repo_for(name: &str) -> Option<FedoraRepo> {
+    repos().ok()?.into_iter().find(|r| {
+        read_index(r)
+            .map(|i| i.by_name.contains_key(name))
+            .unwrap_or(false)
+    })
+}
+
 fn read_index(repo: &FedoraRepo) -> io::Result<Index> {
     let mut index = Index::default();
     let mut missing = 0;
@@ -541,6 +584,27 @@ pub fn install(
     repo: &FedoraRepo,
     name: &str,
 ) -> io::Result<Vec<(StorePath, DebMeta)>> {
+    let mut txn = crate::txn::Txn::begin(store)?;
+    let result = install_in_txn(store, repo, name, &mut txn);
+    match result {
+        Ok(out) => {
+            txn.lock().save()?;
+            txn.commit()?;
+            Ok(out)
+        }
+        Err(e) => {
+            txn.rollback();
+            Err(e)
+        }
+    }
+}
+
+pub fn install_in_txn(
+    store: &Store,
+    repo: &FedoraRepo,
+    name: &str,
+    txn: &mut crate::txn::Txn,
+) -> io::Result<Vec<(StorePath, DebMeta)>> {
     let index = read_index(repo).map_err(|_| {
         io::Error::other(format!(
             "no index for repo '{}'; run `univ update-rpm`",
@@ -548,7 +612,6 @@ pub fn install(
         ))
     })?;
     let installed = resolve::installed_packages(store);
-    let mut lock = crate::lock::Lockfile::load();
 
     let mut plan: Vec<RpmPackage> = Vec::new();
     let mut planned: HashSet<(String, String)> = HashSet::new();
@@ -558,7 +621,7 @@ pub fn install(
         name,
         None,
         None,
-        Some(&lock),
+        Some(txn.lock()),
         &mut plan,
         &mut planned,
     )?;
@@ -588,13 +651,14 @@ pub fn install(
                 }
             }
             let (sp, rpm_meta) = rpm::install(store, bytes)?;
+            txn.add_store(&sp)?;
             rpm::write_meta(&rpm_meta, &sp)?;
             if i + 1 == plan.len() {
-                crate::store::mark_manual(&sp)?;
+                txn.set_manual(&sp)?;
             } else {
                 crate::store::mark_auto(&sp)?;
             }
-            lock.set(crate::lock::LockEntry {
+            txn.lock().set(crate::lock::LockEntry {
                 package: pkg.package.clone(),
                 version: pkg.full_version.clone(),
                 architecture: pkg.architecture.clone(),
@@ -608,14 +672,126 @@ pub fn install(
             let deb_meta: DebMeta = rpm_meta.into();
             out.push((sp, deb_meta));
         }
-        lock.save()?;
     }
     if out.is_empty()
         && let Some(p) = installed.iter().find(|p| p.meta.package == name)
     {
-        crate::store::mark_manual(&p.sp)?;
+        txn.set_manual(&p.sp)?;
     }
     Ok(out)
+}
+
+pub fn upgrade(store: &Store, repo: &FedoraRepo) -> io::Result<Vec<(StorePath, DebMeta)>> {
+    let index = read_index(repo)?;
+    let installed = resolve::installed_packages(store);
+    let plan = plan_upgrades(&installed, &index)?;
+
+    let mut out = Vec::new();
+    if !plan.is_empty() {
+        let mut txn = crate::txn::Txn::begin(store)?;
+        let base = repo.base.trim_end_matches('/');
+        let urls: Vec<String> = plan
+            .iter()
+            .map(|pkg| {
+                if pkg.location.starts_with("http") {
+                    pkg.location.clone()
+                } else {
+                    format!("{base}/{}", pkg.location.trim_start_matches('/'))
+                }
+            })
+            .collect();
+        let result = (|| {
+            let downloaded = crate::term::http_get_many(&urls, Some(MAX_BODY))?;
+            let mut removed: HashSet<StorePath> = HashSet::new();
+            for (pkg, bytes) in plan.iter().zip(downloaded.iter()) {
+                if let Some(expected) = &pkg.sha256 {
+                    let got = sha256_hex(bytes);
+                    if !got.eq_ignore_ascii_case(expected) {
+                        return Err(io::Error::other(format!(
+                            "checksum mismatch for {}: expected {expected}, got {got}",
+                            pkg.location
+                        )));
+                    }
+                }
+                let (sp, rpm_meta) = rpm::install(store, bytes)?;
+                txn.add_store(&sp)?;
+                rpm::write_meta(&rpm_meta, &sp)?;
+                let replaced = installed.iter().find(|p| {
+                    p.meta.package == pkg.package
+                        && (p.meta.architecture == pkg.architecture || pkg.architecture == "noarch")
+                });
+                let was_manual = replaced.map(|p| !crate::store::is_auto(&p.sp)).unwrap_or(false);
+                if let Some(old) = replaced
+                    && old.sp != sp
+                    && removed.insert(old.sp.clone())
+                {
+                    txn.remove_store(&old.sp)?;
+                }
+                if was_manual {
+                    txn.set_manual(&sp)?;
+                } else {
+                    crate::store::mark_auto(&sp)?;
+                }
+                txn.lock().set(crate::lock::LockEntry {
+                    package: pkg.package.clone(),
+                    version: pkg.full_version.clone(),
+                    architecture: pkg.architecture.clone(),
+                    sha256: pkg
+                        .sha256
+                        .clone()
+                        .unwrap_or_else(|| sha256_hex(bytes)),
+                    base: repo.base.clone(),
+                    kind: "rpm".to_string(),
+                });
+                let deb_meta: DebMeta = rpm_meta.into();
+                out.push((sp, deb_meta));
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                txn.lock().save()?;
+                txn.commit()?;
+            }
+            Err(e) => {
+                txn.rollback();
+                return Err(e);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn plan_upgrades(installed: &[resolve::Installed], index: &Index) -> io::Result<Vec<RpmPackage>> {
+    let mut targets: HashSet<(String, String)> = HashSet::new();
+    for p in installed {
+        if let Some(c) = best_candidate(index, &p.meta.package, &p.meta.architecture, None)
+            && version::compare(&c.full_version, &p.meta.version).is_gt()
+        {
+            targets.insert((p.meta.package.clone(), p.meta.architecture.clone()));
+        }
+    }
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rest: Vec<resolve::Installed> = installed
+        .iter()
+        .filter(|p| {
+            !targets.contains(&(p.meta.package.clone(), p.meta.architecture.clone()))
+        })
+        .cloned()
+        .collect();
+    let mut plan = Vec::new();
+    let mut planned: HashSet<(String, String)> = HashSet::new();
+    for (name, arch) in &targets {
+        let arch_opt = if arch == "noarch" {
+            None
+        } else {
+            Some(arch.as_str())
+        };
+        plan_package(&rest, index, name, arch_opt, None, None, &mut plan, &mut planned)?;
+    }
+    Ok(plan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -653,6 +829,18 @@ fn plan_package(
             io::Error::other(format!("cannot satisfy dependency '{name}'"))
         })?;
 
+    plan_candidate(installed, index, candidate, &desired, locked, plan, planned)
+}
+
+fn plan_candidate(
+    installed: &[resolve::Installed],
+    index: &Index,
+    candidate: RpmPackage,
+    desired: &str,
+    locked: Option<&crate::lock::Lockfile>,
+    plan: &mut Vec<RpmPackage>,
+    planned: &mut HashSet<(String, String)>,
+) -> io::Result<()> {
     let key = (candidate.package.clone(), candidate.architecture.clone());
     if !planned.insert(key) {
         return Ok(());
@@ -661,7 +849,7 @@ fn plan_package(
     for group in &candidate.requires {
         let mut chosen: Option<io::Error> = None;
         for alt in group {
-            let dep_arch = desired.clone();
+            let dep_arch = desired.to_string();
             let mut sub_plan = Vec::new();
             let mut sub_planned = planned.clone();
             match plan_package(
@@ -792,6 +980,48 @@ mod tests {
         let mut planned = HashSet::new();
         plan_package(&[], index, name, None, None, None, &mut plan, &mut planned).unwrap();
         plan.iter().map(|p| p.package.clone()).collect()
+    }
+
+    fn installed(name: &str, version: &str) -> resolve::Installed {
+        let sp = StorePath::parse(&format!("{}-{name}", "b".repeat(64))).unwrap();
+        resolve::Installed {
+            sp,
+            meta: DebMeta {
+                package: name.into(),
+                version: version.into(),
+                architecture: "x86_64".into(),
+                ..Default::default()
+            },
+            root: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn upgrade_plans_only_changed_packages() {
+        let index = idx(vec![
+            pkg("app", "1.0", vec![vec![RpmDep::package_only("lib")]]),
+            pkg("app", "2.0", vec![vec![RpmDep::package_only("lib")]]),
+            pkg("lib", "1.0", vec![]),
+            pkg("lib", "2.0", vec![]),
+            pkg("same", "3.0", vec![]),
+        ]);
+        let installed = vec![
+            installed("app", "1.0-1"),
+            installed("lib", "1.0-1"),
+            installed("same", "3.0-1"),
+        ];
+        let plan = plan_upgrades(&installed, &index).unwrap();
+        let names: Vec<String> = plan.iter().map(|p| p.package.clone()).collect();
+        assert_eq!(names, vec!["lib", "app"]);
+        assert_eq!(plan[0].full_version, "2.0-1");
+        assert_eq!(plan[1].full_version, "2.0-1");
+    }
+
+    #[test]
+    fn upgrade_plan_is_empty_when_all_uptodate() {
+        let index = idx(vec![pkg("app", "1.0", vec![])]);
+        let installed = vec![installed("app", "1.0-1")];
+        assert!(plan_upgrades(&installed, &index).unwrap().is_empty());
     }
 
     #[test]

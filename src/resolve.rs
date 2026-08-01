@@ -34,6 +34,7 @@ const STORE_LIB_DIRS: &[&str] = &[
     "lib64",
 ];
 
+#[derive(Clone)]
 pub struct Installed {
     pub sp: StorePath,
     pub meta: DebMeta,

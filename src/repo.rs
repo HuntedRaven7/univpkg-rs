@@ -222,89 +222,133 @@ fn default_arches() -> Vec<String> {
     DEFAULT_ARCHES.iter().map(|a| a.to_string()).collect()
 }
 
-fn cache_path(repo: &Repo, arch: &str) -> io::Result<PathBuf> {
+fn component_cache_path(repo: &Repo, arch: &str, component: &str) -> io::Result<PathBuf> {
     Ok(Store::root()?
         .join("cache")
-        .join(format!("{}.Packages.{arch}", repo.name)))
+        .join(format!("{}.Packages.{arch}.{component}", repo.name)))
+}
+
+fn component_meta_path(repo: &Repo, arch: &str, component: &str) -> io::Result<PathBuf> {
+    Ok(Store::root()?
+        .join("cache")
+        .join(format!("{}.Packages.{arch}.{component}.meta", repo.name)))
 }
 
 pub fn update(repo: &Repo) -> io::Result<usize> {
     let mut total = 0;
     for arch in &repo.arches {
         let mut index = Index::default();
-        let mut fetched = 0;
         for component in COMPONENTS {
             let base = format!(
                 "{}/dists/{}/{}/binary-{}/Packages",
                 repo.base, DIST, component, arch
             );
             let label = format!("{} ({component}/{arch} Packages)", repo.name);
-            match fetch_index(&base, &label) {
-                Ok((text, _)) => {
+            let cache_file = component_cache_path(repo, arch, component)?;
+            let meta_file = component_meta_path(repo, arch, component)?;
+            let validators = crate::term::load_validators(&meta_file);
+            match fetch_index(&base, &label, &validators) {
+                Ok(crate::term::FetchOutcome::Modified((text, url), new_validators)) => {
                     let sub = parse_index(&text);
-                    fetched += 1;
-                    total += sub.by_name.values().map(|v| v.len()).sum::<usize>();
+                    write_component_cache(&cache_file, &meta_file, &sub, &url, &new_validators)?;
                     index.merge(sub);
                 }
+                Ok(crate::term::FetchOutcome::NotModified) if cache_file.exists() => {
+                    if let Ok(text) = fs::read_to_string(&cache_file) {
+                        index.merge(parse_index(&text));
+                    }
+                }
+                Ok(crate::term::FetchOutcome::NotModified) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
-        if fetched == 0 {
-            continue;
-        }
-        let path = cache_path(repo, arch)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, render_index(&index))?;
         let n = index.by_name.values().map(|v| v.len()).sum::<usize>();
+        total += n;
         println!(
-            "{} ({arch}): {} packages across {} components",
+            "{} ({arch}): {} packages",
             crate::term::cyan(&repo.name),
-            n,
-            fetched
+            n
         );
     }
     Ok(total)
 }
 
-fn fetch_index(base: &str, label: &str) -> io::Result<(String, String)> {
+fn write_component_cache(
+    cache_file: &std::path::Path,
+    meta_file: &std::path::Path,
+    index: &Index,
+    url: &str,
+    validators: &crate::term::CacheValidators,
+) -> io::Result<()> {
+    if let Some(parent) = cache_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(cache_file, render_index(index))?;
+    let mut v = validators.clone();
+    v.url = Some(url.to_string());
+    crate::term::save_validators(meta_file, &v)
+}
+
+fn fetch_index(
+    base: &str,
+    label: &str,
+    validators: &crate::term::CacheValidators,
+) -> io::Result<crate::term::FetchOutcome<(String, String)>> {
     let mut last_err: Option<io::Error> = None;
     for ext in ["xz", "gz", ""] {
-        match fetch_index_ext(base, ext, label) {
+        let url = if ext.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}.{ext}")
+        };
+        let cond = if validators.url.as_deref() == Some(url.as_str()) {
+            validators.clone()
+        } else {
+            crate::term::CacheValidators::default()
+        };
+        match fetch_index_ext(&url, ext, label, &cond) {
             Ok(v) => return Ok(v),
-            Err(e) => last_err = Some(e),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => last_err = Some(e),
+            Err(e) => return Err(e),
         }
     }
     Err(last_err
         .unwrap_or_else(|| io::Error::other("no Packages index available")))
 }
 
-fn fetch_index_ext(base: &str, ext: &str, label: &str) -> io::Result<(String, String)> {
-    let url = if ext.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}.{ext}")
-    };
-    let bytes = crate::term::http_get(&url, label, None)?;
-    let text = match ext {
-        "xz" => {
-            let mut out = Vec::new();
-            lzma_rs::xz_decompress(&mut &bytes[..], &mut out)
-                .map_err(|e| io::Error::other(format!("xz: {e}")))?;
-            String::from_utf8(out).map_err(io::Error::other)?
+fn fetch_index_ext(
+    url: &str,
+    ext: &str,
+    label: &str,
+    validators: &crate::term::CacheValidators,
+) -> io::Result<crate::term::FetchOutcome<(String, String)>> {
+    let outcome = crate::term::http_get_conditional(url, label, None, validators)?;
+    match outcome {
+        crate::term::FetchOutcome::NotModified => Ok(crate::term::FetchOutcome::NotModified),
+        crate::term::FetchOutcome::Modified(bytes, new_validators) => {
+            let text = match ext {
+                "xz" => {
+                    let mut out = Vec::new();
+                    lzma_rs::xz_decompress(&mut &bytes[..], &mut out)
+                        .map_err(|e| io::Error::other(format!("xz: {e}")))?;
+                    String::from_utf8(out).map_err(io::Error::other)?
+                }
+                "gz" => {
+                    use std::io::Cursor;
+                    let mut out = Vec::new();
+                    flate2::read::GzDecoder::new(Cursor::new(&bytes))
+                        .read_to_end(&mut out)?;
+                    String::from_utf8(out).map_err(io::Error::other)?
+                }
+                _ => String::from_utf8(bytes).map_err(io::Error::other)?,
+            };
+            Ok(crate::term::FetchOutcome::Modified(
+                (text, url.to_string()),
+                new_validators,
+            ))
         }
-        "gz" => {
-            use std::io::Cursor;
-            let mut out = Vec::new();
-            flate2::read::GzDecoder::new(Cursor::new(&bytes))
-                .read_to_end(&mut out)?;
-            String::from_utf8(out).map_err(io::Error::other)?
-        }
-        _ => String::from_utf8(bytes).map_err(io::Error::other)?,
-    };
-    Ok((text, url))
+    }
 }
 
 fn parse_index(text: &str) -> Index {
@@ -425,15 +469,17 @@ fn render_index(index: &Index) -> String {
 
 fn read_index(repo: &Repo) -> io::Result<Index> {
     let mut index = Index::default();
-    let mut missing = 0;
+    let mut found = 0;
     for arch in &repo.arches {
-        let path = cache_path(repo, arch)?;
-        match fs::read_to_string(&path) {
-            Ok(text) => index.merge(parse_index(&text)),
-            Err(_) => missing += 1,
+        for component in COMPONENTS {
+            let path = component_cache_path(repo, arch, component)?;
+            if let Ok(text) = fs::read_to_string(&path) {
+                index.merge(parse_index(&text));
+                found += 1;
+            }
         }
     }
-    if missing == repo.arches.len() {
+    if found == 0 {
         return Err(io::Error::other(format!(
             "no index for repo '{}'; run `univ update`",
             repo.name
@@ -460,11 +506,53 @@ pub fn search(repo: &Repo, query: &str) -> Vec<Package> {
     out
 }
 
+pub fn available_names() -> Vec<String> {
+    let mut names: HashSet<String> = HashSet::new();
+    if let Ok(repos) = repos() {
+        for r in &repos {
+            if let Ok(index) = read_index(r) {
+                names.extend(index.by_name.keys().cloned());
+            }
+        }
+    }
+    let mut v: Vec<String> = names.into_iter().collect();
+    v.sort();
+    v
+}
+
+pub fn repo_for(name: &str) -> Option<Repo> {
+    repos().ok()?.into_iter().find(|r| {
+        read_index(r)
+            .map(|i| i.by_name.contains_key(name))
+            .unwrap_or(false)
+    })
+}
+
 pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StorePath, DebMeta)>> {
+    let mut txn = crate::txn::Txn::begin(store)?;
+    let result = install_in_txn(store, repo, name, &mut txn);
+    match result {
+        Ok(out) => {
+            txn.lock().save()?;
+            txn.commit()?;
+            Ok(out)
+        }
+        Err(e) => {
+            txn.rollback();
+            Err(e)
+        }
+    }
+}
+
+pub fn install_in_txn(
+    store: &Store,
+    repo: &Repo,
+    name: &str,
+    txn: &mut crate::txn::Txn,
+) -> io::Result<Vec<(StorePath, DebMeta)>> {
     let index = read_index(repo)
         .map_err(|_| io::Error::other(format!("no index for repo '{}'; run `univ update`", repo.name)))?;
     let installed = resolve::installed_packages(store);
-    let mut lock = crate::lock::Lockfile::load();
 
     let (pkg_name, pkg_arch) = split_name_arch(name);
 
@@ -476,7 +564,7 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
         &pkg_name,
         pkg_arch.as_deref(),
         None,
-        Some(&lock),
+        Some(txn.lock()),
         &mut plan,
         &mut planned,
     )?;
@@ -488,7 +576,7 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
             .map(|pkg| format!("{}/{}", repo.base, pkg.filename))
             .collect();
         let downloaded = crate::term::http_get_many(&urls, None)?;
-        for (i, (pkg, bytes)) in plan.iter().zip(downloaded.iter()).enumerate() {
+        for (pkg, bytes) in plan.iter().zip(downloaded.iter()) {
             if let Some(expected) = &pkg.sha256 {
                 let got = sha256_hex(bytes);
                 if !got.eq_ignore_ascii_case(expected) {
@@ -498,14 +586,17 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
                     )));
                 }
             }
+        }
+        for (i, (pkg, bytes)) in plan.iter().zip(downloaded.iter()).enumerate() {
             let (sp, meta) = deb::install(store, bytes)?;
+            txn.add_store(&sp)?;
             deb::write_meta(&meta, &sp)?;
             if i + 1 == plan.len() {
-                crate::store::mark_manual(&sp)?;
+                txn.set_manual(&sp)?;
             } else {
                 crate::store::mark_auto(&sp)?;
             }
-            lock.set(crate::lock::LockEntry {
+            txn.lock().set(crate::lock::LockEntry {
                 package: pkg.package.clone(),
                 version: pkg.version.clone(),
                 architecture: pkg.architecture.clone(),
@@ -518,16 +609,115 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
             });
             out.push((sp, meta));
         }
-        lock.save()?;
     }
     if out.is_empty()
         && let Some(p) = installed
             .iter()
             .find(|p| p.meta.package == pkg_name)
     {
-        crate::store::mark_manual(&p.sp)?;
+        txn.set_manual(&p.sp)?;
     }
     Ok(out)
+}
+
+pub fn upgrade(store: &Store, repo: &Repo) -> io::Result<Vec<(StorePath, DebMeta)>> {
+    let index = read_index(repo)?;
+    let installed = resolve::installed_packages(store);
+    let plan = plan_upgrades(&installed, &index)?;
+
+    let mut out = Vec::new();
+    if !plan.is_empty() {
+        let mut txn = crate::txn::Txn::begin(store)?;
+        let urls: Vec<String> = plan
+            .iter()
+            .map(|pkg| format!("{}/{}", repo.base, pkg.filename))
+            .collect();
+        let result = (|| {
+            let downloaded = crate::term::http_get_many(&urls, None)?;
+            let mut removed: HashSet<StorePath> = HashSet::new();
+            for (pkg, bytes) in plan.iter().zip(downloaded.iter()) {
+                if let Some(expected) = &pkg.sha256 {
+                    let got = sha256_hex(bytes);
+                    if !got.eq_ignore_ascii_case(expected) {
+                        return Err(io::Error::other(format!(
+                            "checksum mismatch for {}: expected {expected}, got {got}",
+                            pkg.filename
+                        )));
+                    }
+                }
+                let (sp, meta) = deb::install(store, bytes)?;
+                txn.add_store(&sp)?;
+                deb::write_meta(&meta, &sp)?;
+                let replaced = installed.iter().find(|p| {
+                    p.meta.package == pkg.package
+                        && (p.meta.architecture == pkg.architecture || pkg.architecture == "all")
+                });
+                let was_manual = replaced.map(|p| !crate::store::is_auto(&p.sp)).unwrap_or(false);
+                if let Some(old) = replaced
+                    && old.sp != sp
+                    && removed.insert(old.sp.clone())
+                {
+                    txn.remove_store(&old.sp)?;
+                }
+                if was_manual {
+                    txn.set_manual(&sp)?;
+                } else {
+                    crate::store::mark_auto(&sp)?;
+                }
+                txn.lock().set(crate::lock::LockEntry {
+                    package: pkg.package.clone(),
+                    version: pkg.version.clone(),
+                    architecture: pkg.architecture.clone(),
+                    sha256: pkg
+                        .sha256
+                        .clone()
+                        .unwrap_or_else(|| sha256_hex(bytes)),
+                    base: repo.base.clone(),
+                    kind: "deb".to_string(),
+                });
+                out.push((sp, meta));
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                txn.lock().save()?;
+                txn.commit()?;
+            }
+            Err(e) => {
+                txn.rollback();
+                return Err(e);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn plan_upgrades(installed: &[resolve::Installed], index: &Index) -> io::Result<Vec<Package>> {
+    let mut targets: HashSet<(String, String)> = HashSet::new();
+    for p in installed {
+        if let Some(c) = best_candidate(index, &p.meta.package, &p.meta.architecture, None)
+            && version::compare(&c.version, &p.meta.version).is_gt()
+        {
+            targets.insert((p.meta.package.clone(), p.meta.architecture.clone()));
+        }
+    }
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rest: Vec<resolve::Installed> = installed
+        .iter()
+        .filter(|p| {
+            !targets.contains(&(p.meta.package.clone(), p.meta.architecture.clone()))
+        })
+        .cloned()
+        .collect();
+    let mut plan = Vec::new();
+    let mut planned: HashSet<(String, String)> = HashSet::new();
+    for (name, arch) in &targets {
+        plan_package(&rest, index, name, Some(arch.as_str()), None, None, &mut plan, &mut planned)?;
+    }
+    Ok(plan)
 }
 
 fn split_name_arch(s: &str) -> (String, Option<String>) {
@@ -571,6 +761,17 @@ fn plan_package(
             io::Error::other(format!("cannot satisfy dependency '{}'", name))
         })?;
 
+    plan_candidate(installed, index, candidate, locked, plan, planned)
+}
+
+fn plan_candidate(
+    installed: &[resolve::Installed],
+    index: &Index,
+    candidate: Package,
+    locked: Option<&crate::lock::Lockfile>,
+    plan: &mut Vec<Package>,
+    planned: &mut HashSet<(String, String)>,
+) -> io::Result<()> {
     let key = (candidate.package.clone(), candidate.architecture.clone());
     if !planned.insert(key) {
         return Ok(());
@@ -901,6 +1102,50 @@ mod tests {
         assert_eq!(plan[0].version, "2.0");
     }
 
+    fn installed(name: &str, version: &str, arch: &str) -> resolve::Installed {
+        let sp = StorePath::parse(&format!("{}-{name}", "a".repeat(64))).unwrap();
+        resolve::Installed {
+            sp,
+            meta: DebMeta {
+                package: name.into(),
+                version: version.into(),
+                architecture: arch.into(),
+                ..Default::default()
+            },
+            root: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn upgrade_plans_only_changed_packages() {
+        let idx = index_of(vec![
+            pkg_arch("app", "1.0", "amd64", vec![vec![Dep::package_only("lib")]]),
+            pkg_arch("app", "2.0", "amd64", vec![vec![Dep::package_only("lib")]]),
+            pkg_arch("lib", "1.0", "amd64", vec![]),
+            pkg_arch("lib", "2.0", "amd64", vec![]),
+            pkg_arch("same", "3.0", "amd64", vec![]),
+            pkg_arch("gone", "1.0", "amd64", vec![]),
+        ]);
+        let installed = vec![
+            installed("app", "1.0", "amd64"),
+            installed("lib", "1.0", "amd64"),
+            installed("same", "3.0", "amd64"),
+            installed("gone", "1.0", "amd64"),
+        ];
+        let plan = plan_upgrades(&installed, &idx).unwrap();
+        let names: Vec<String> = plan.iter().map(|p| p.package.clone()).collect();
+        assert_eq!(names, vec!["lib", "app"]);
+        assert_eq!(plan[0].version, "2.0");
+        assert_eq!(plan[1].version, "2.0");
+    }
+
+    #[test]
+    fn upgrade_plan_is_empty_when_all_uptodate() {
+        let idx = index_of(vec![pkg_arch("app", "1.0", "amd64", vec![])]);
+        let installed = vec![installed("app", "1.0", "amd64")];
+        assert!(plan_upgrades(&installed, &idx).unwrap().is_empty());
+    }
+
     #[test]
     fn search_matches_name_and_description() {
         let _g = crate::store::TEST_HOME_LOCK.lock().unwrap();
@@ -922,7 +1167,7 @@ mod tests {
         let cache_dir = tmp.join(".local/univ/cache");
         fs::create_dir_all(&cache_dir).unwrap();
         fs::write(
-            cache_dir.join("debian.Packages.amd64"),
+            cache_dir.join("debian.Packages.amd64.main"),
             "\
 Package: steam-installer
 Version: 1.0.0.81

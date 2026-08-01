@@ -2,12 +2,14 @@ mod deb;
 mod elf;
 mod link;
 mod lock;
+mod profile;
 mod repo;
 mod resolve;
 mod rpm;
 mod rpmrepo;
 mod store;
 mod term;
+mod txn;
 mod version;
 
 use std::io;
@@ -527,6 +529,50 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        "upgrade" => {
+            let store = match store::Store::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut upgraded = 0;
+            let mut failed = false;
+            if let Ok(repos) = repo::repos() {
+                for r in &repos {
+                    match repo::upgrade(&store, r) {
+                        Ok(installed) => {
+                            upgraded += report_upgrades(&store, &installed);
+                        }
+                        Err(e) => {
+                            eprintln!("{}", term::error(&e.to_string()));
+                            failed = true;
+                        }
+                    }
+                }
+            }
+            if let Ok(repos) = rpmrepo::repos() {
+                for r in &repos {
+                    match rpmrepo::upgrade(&store, r) {
+                        Ok(installed) => {
+                            upgraded += report_upgrades(&store, &installed);
+                        }
+                        Err(e) => {
+                            eprintln!("{}", term::error(&e.to_string()));
+                            failed = true;
+                        }
+                    }
+                }
+            }
+            if upgraded == 0 && !failed {
+                println!("{}", term::dim("nothing to upgrade"));
+            }
+            if failed && upgraded == 0 {
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
         "autoclean" => match link::autoclean() {
             Ok(orphans) => {
                 if orphans.is_empty() {
@@ -599,6 +645,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "profile" => run_profile(&args[1..]),
         other => {
             eprintln!("{}", term::error(&format!("unknown command '{other}'")));
             ExitCode::FAILURE
@@ -665,6 +712,25 @@ fn install_package(arg: &str) -> ExitCode {    let store = match store::Store::o
     }
 }
 
+fn report_upgrades(store: &store::Store, installed: &[(store::StorePath, deb::DebMeta)]) -> usize {
+    for (sp, meta) in installed {
+        println!(
+            "{} {}-{} [{}]",
+            term::bold_green("upgraded"),
+            term::bold_cyan(&meta.package),
+            term::green(&meta.version),
+            term::magenta(&meta.architecture)
+        );
+        if let Err(e) = link::link_package(store, sp, meta) {
+            eprintln!(
+                "{}",
+                term::warn(&format!("warning: relink {}: {e}", meta.package))
+            );
+        }
+    }
+    installed.len()
+}
+
 fn installed_line(meta: &deb::DebMeta) -> String {
     format!(
         "{} {}-{} [{}]",
@@ -707,8 +773,209 @@ fn print_help() {
     println!("  unlink <package>        remove a package's launchers and desktop entries");
     println!("  uninstall <package>     remove a package's files, launchers and store path");
     println!("                          (plus no-longer-needed dependencies)");
+    println!("  upgrade                 upgrade installed packages to the newest available version");
+    println!("                          (downloads only the changed packages)");
     println!("  autoclean               remove orphaned dependency packages");
     println!("  lock                    show the pinned package versions (lock.json)");
+    println!();
+    println!("  -- Profiles --");
+    println!("  profile new <name> <pkg...>   save a declarative profile listing packages");
+    println!("  profile add <name> <pkg...>   append packages to a profile");
+    println!("  profile list                  list saved profiles");
+    println!("  profile show <name>           print a profile's packages");
+    println!("  profile rm <name>             delete a profile");
+    println!("  profile apply <name>          sync the store to a profile in one transaction");
+    println!("                                (installs missing packages, removes extras)");
+}
+
+fn run_profile(args: &[String]) -> ExitCode {
+    let sub = match args.first() {
+        Some(s) => s.as_str(),
+        None => {
+            eprintln!("usage: univ profile <new|list|show|rm|apply> ...");
+            return ExitCode::FAILURE;
+        }
+    };
+    match sub {
+        "new" => {
+            let Some((name, pkgs)) = split_profile_args(&args[1..]) else {
+                eprintln!("usage: univ profile new <name> <package ...>");
+                return ExitCode::FAILURE;
+            };
+            match profile::save(&name, &pkgs) {
+                Ok(()) => {
+                    warn_unknown(&pkgs);
+                    println!(
+                        "{} {} ({})",
+                        term::bold_green("saved"),
+                        term::bold_cyan(&name),
+                        term::dim(&format!("{} package(s)", pkgs.len()))
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "add" => {
+            let Some((name, pkgs)) = split_profile_args(&args[1..]) else {
+                eprintln!("usage: univ profile add <name> <package ...>");
+                return ExitCode::FAILURE;
+            };
+            let mut current = profile::show(&name).unwrap_or_default();
+            for p in pkgs {
+                if !current.contains(&p) {
+                    current.push(p);
+                }
+            }
+            match profile::save(&name, &current) {
+                Ok(()) => {
+                    warn_unknown(&current);
+                    println!(
+                        "{} {} ({})",
+                        term::bold_green("saved"),
+                        term::bold_cyan(&name),
+                        term::dim(&format!("{} package(s)", current.len()))
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "list" => match profile::list() {
+            Ok(names) => {
+                if names.is_empty() {
+                    println!("{}", term::dim("no profiles"));
+                }
+                for n in names {
+                    println!("{}", term::bold_cyan(&n));
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", term::error(&e.to_string()));
+                ExitCode::FAILURE
+            }
+        },
+        "show" => {
+            let Some(name) = args.get(1) else {
+                eprintln!("usage: univ profile show <name>");
+                return ExitCode::FAILURE;
+            };
+            match profile::show(name) {
+                Ok(pkgs) => {
+                    for p in pkgs {
+                        println!("{}", p);
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "rm" | "remove" => {
+            let Some(name) = args.get(1) else {
+                eprintln!("usage: univ profile rm <name>");
+                return ExitCode::FAILURE;
+            };
+            match profile::remove(name) {
+                Ok(()) => {
+                    println!(
+                        "{} {}",
+                        term::bold_green("removed"),
+                        term::bold_cyan(&format!("'{}'", name))
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "apply" => {
+            let Some(name) = args.get(1) else {
+                eprintln!("usage: univ profile apply <name>");
+                return ExitCode::FAILURE;
+            };
+            let store = match store::Store::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    return ExitCode::FAILURE;
+                }
+            };
+            match profile::apply(&store, name) {
+                Ok(res) => {
+                    if res.installed == 0 && res.removed == 0 {
+                        println!("{}", term::dim("already in sync"));
+                    }
+                    if res.installed > 0 {
+                        println!(
+                            "{} {} package(s)",
+                            term::bold_green("installed"),
+                            res.installed
+                        );
+                    }
+                    if res.removed > 0 {
+                        println!(
+                            "{} {} package(s)",
+                            term::bold_green("removed"),
+                            res.removed
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        other => {
+            eprintln!(
+                "{}",
+                term::error(&format!("unknown profile command '{other}'"))
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn split_profile_args(rest: &[String]) -> Option<(String, Vec<String>)> {
+    if rest.is_empty() {
+        return None;
+    }
+    let name = rest[0].clone();
+    let pkgs: Vec<String> = rest[1..]
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    Some((name, pkgs))
+}
+
+fn warn_unknown(pkgs: &[String]) {
+    let mut available: std::collections::HashSet<String> =
+        repo::available_names().into_iter().collect();
+    available.extend(rpmrepo::available_names());
+    for p in pkgs {
+        if !available.contains(p) {
+            eprintln!(
+                "{}",
+                term::warn(&format!(
+                    "'{p}' is not in any repo index (run `univ update` / `univ update-rpm`)"
+                ))
+            );
+        }
+    }
 }
 
 fn report_linked(linked: &link::Linked) {

@@ -1,4 +1,8 @@
+use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
@@ -185,8 +189,57 @@ fn term_width() -> usize {
         .unwrap_or(80)
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CacheValidators {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+}
+
+pub enum FetchOutcome<T> {
+    NotModified,
+    Modified(T, CacheValidators),
+}
+
+pub fn load_validators(path: &Path) -> CacheValidators {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_validators(path: &Path, v: &CacheValidators) -> io::Result<()> {
+    let json = serde_json::to_string(v).map_err(io::Error::other)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, json)
+}
+
 pub fn http_get(url: &str, label: &str, max: Option<u64>) -> io::Result<Vec<u8>> {
-    let mut res = match ureq::get(url).call() {
+    match http_get_conditional(url, label, max, &CacheValidators::default())? {
+        FetchOutcome::Modified(bytes, _) => Ok(bytes),
+        FetchOutcome::NotModified => Err(io::Error::other(format!("{url}: unexpected 304"))),
+    }
+}
+
+pub fn http_get_conditional(
+    url: &str,
+    label: &str,
+    max: Option<u64>,
+    validators: &CacheValidators,
+) -> io::Result<FetchOutcome<Vec<u8>>> {
+    let mut req = ureq::get(url);
+    if let Some(etag) = &validators.etag {
+        req = req.header("If-None-Match", etag);
+    }
+    if let Some(lm) = &validators.last_modified {
+        req = req.header("If-Modified-Since", lm);
+    }
+    let mut res = match req.call() {
         Ok(r) => r,
         Err(ureq::Error::StatusCode(404)) => {
             return Err(io::Error::new(
@@ -196,6 +249,9 @@ pub fn http_get(url: &str, label: &str, max: Option<u64>) -> io::Result<Vec<u8>>
         }
         Err(e) => return Err(io::Error::other(format!("{url}: {e}"))),
     };
+    if res.status().as_u16() == 304 {
+        return Ok(FetchOutcome::NotModified);
+    }
     let total = res.body().content_length();
     let mut progress = Progress::new(label, total);
     let mut reader = res
@@ -218,7 +274,20 @@ pub fn http_get(url: &str, label: &str, max: Option<u64>) -> io::Result<Vec<u8>>
         progress.advance(n as u64);
     }
     progress.finish();
-    Ok(buf)
+    let new_validators = CacheValidators {
+        url: Some(url.to_string()),
+        etag: res
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        last_modified: res
+            .headers()
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+    };
+    Ok(FetchOutcome::Modified(buf, new_validators))
 }
 
 pub fn http_get_many(urls: &[String], max: Option<u64>) -> io::Result<Vec<Vec<u8>>> {
