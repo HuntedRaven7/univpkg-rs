@@ -223,6 +223,11 @@ fn remove_orphans(store: &Store) -> Vec<String> {
     removed
 }
 
+pub fn autoclean() -> io::Result<Vec<String>> {
+    let store = Store::open()?;
+    Ok(remove_orphans(&store))
+}
+
 pub fn uninstall(package: &str) -> io::Result<(usize, usize, Vec<String>)> {
     let (pkg, arch) = match package.rsplit_once(':') {
         Some((p, a)) => (p, Some(a)),

@@ -46,7 +46,8 @@ nice-to-have
 ## Usage
 
 ```
-univ init                      create the store at ~/.local/univ
+univ init                      create the store at ~/.local/univ and write the
+                               default Debian and Fedora repos
 
 univ status                    list installed store paths
 univ list                      list installed packages (name, version, arch, description)
@@ -74,6 +75,7 @@ univ rehash                    rebuild launchers for all installed packages
 univ unlink <package>          remove a package's launchers and desktop entries
 univ uninstall <package>       remove a package's files, launchers and store path
                                (plus any no-longer-needed dependencies)
+univ autoclean                 remove all orphaned dependency packages
 ```
 
 ## TUI store manager

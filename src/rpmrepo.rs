@@ -180,6 +180,18 @@ pub fn repos() -> io::Result<Vec<FedoraRepo>> {
     Ok(out)
 }
 
+pub fn ensure_default_repo() -> io::Result<()> {
+    let conf = Store::root()?.join("rpmrepos.conf");
+    if conf.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = conf.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let line = format!("{DEFAULT_FEDORA_REPO_NAME} {}\n", default_fedora_base_url());
+    fs::write(&conf, line)
+}
+
 pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
     let conf = Store::root()?.join("rpmrepos.conf");
     if let Some(parent) = conf.parent() {
@@ -542,36 +554,39 @@ pub fn install(
     plan_package(&installed, &index, name, None, None, &mut plan, &mut planned)?;
 
     let mut out = Vec::new();
-    for (i, pkg) in plan.iter().enumerate() {
-        let label = format!(
-            "downloading {}-{} [{}]",
-            pkg.package, pkg.full_version, pkg.architecture
-        );
+    if !plan.is_empty() {
         let base = repo.base.trim_end_matches('/');
-        let url = if pkg.location.starts_with("http") {
-            pkg.location.clone()
-        } else {
-            format!("{base}/{}", pkg.location.trim_start_matches('/'))
-        };
-        let bytes = crate::term::http_get(&url, &label, Some(MAX_BODY))?;
-        if let Some(expected) = &pkg.sha256 {
-            let got = sha256_hex(&bytes);
-            if !got.eq_ignore_ascii_case(expected) {
-                return Err(io::Error::other(format!(
-                    "checksum mismatch for {}: expected {expected}, got {got}",
-                    pkg.location
-                )));
+        let urls: Vec<String> = plan
+            .iter()
+            .map(|pkg| {
+                if pkg.location.starts_with("http") {
+                    pkg.location.clone()
+                } else {
+                    format!("{base}/{}", pkg.location.trim_start_matches('/'))
+                }
+            })
+            .collect();
+        let downloaded = crate::term::http_get_many(&urls, Some(MAX_BODY))?;
+        for (i, (pkg, bytes)) in plan.iter().zip(downloaded.iter()).enumerate() {
+            if let Some(expected) = &pkg.sha256 {
+                let got = sha256_hex(bytes);
+                if !got.eq_ignore_ascii_case(expected) {
+                    return Err(io::Error::other(format!(
+                        "checksum mismatch for {}: expected {expected}, got {got}",
+                        pkg.location
+                    )));
+                }
             }
+            let (sp, rpm_meta) = rpm::install(store, bytes)?;
+            rpm::write_meta(&rpm_meta, &sp)?;
+            if i + 1 == plan.len() {
+                crate::store::mark_manual(&sp)?;
+            } else {
+                crate::store::mark_auto(&sp)?;
+            }
+            let deb_meta: DebMeta = rpm_meta.into();
+            out.push((sp, deb_meta));
         }
-        let (sp, rpm_meta) = rpm::install(store, &bytes)?;
-        rpm::write_meta(&rpm_meta, &sp)?;
-        if i + 1 == plan.len() {
-            crate::store::mark_manual(&sp)?;
-        } else {
-            crate::store::mark_auto(&sp)?;
-        }
-        let deb_meta: DebMeta = rpm_meta.into();
-        out.push((sp, deb_meta));
     }
     if out.is_empty()
         && let Some(p) = installed.iter().find(|p| p.meta.package == name)
