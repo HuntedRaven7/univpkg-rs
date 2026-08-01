@@ -92,17 +92,15 @@ pub fn read_elf(bytes: &[u8]) -> Option<ElfInfo> {
                 _ => {}
             }
         }
-        if let Some(strtab) = strtab_vaddr {
-            if let Some(off) = vaddr_to_offset(&loads, strtab) {
+        if let Some(strtab) = strtab_vaddr
+            && let Some(off) = vaddr_to_offset(&loads, strtab) {
                 for v in needed_offsets {
-                    if let Some(so) = off.checked_add(v) {
-                        if let Some(s) = read_cstring(bytes, so as usize) {
+                    if let Some(so) = off.checked_add(v)
+                        && let Some(s) = read_cstring(bytes, so as usize) {
                             needed.push(s);
                         }
-                    }
                 }
             }
-        }
     }
 
     Some(ElfInfo {

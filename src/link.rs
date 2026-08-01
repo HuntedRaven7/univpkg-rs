@@ -20,7 +20,7 @@ const BIN_DIRS: &[&str] = &[
     "usr/local/sbin",
 ];
 
-const DESKTOP_SUFFIX: &str = " (univpkg)";
+const DESKTOP_SUFFIX: &str = " (univ)";
 
 #[derive(Clone, Debug, Default)]
 pub struct Linked {
@@ -68,7 +68,7 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
                 linked.bin_links.push(dest.clone());
                 manifest.push(('B', dest, src));
             }
-            Err(e) => eprintln!("unipkg: warning: not linking {name}: {e}"),
+            Err(e) => eprintln!("univ: warning: not linking {name}: {e}"),
         }
     }
 
@@ -85,7 +85,7 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
             let text = match fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("unipkg: warning: skipping {file_name}: {e}");
+                    eprintln!("univ: warning: skipping {file_name}: {e}");
                     continue;
                 }
             };
@@ -96,11 +96,11 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
                 &pixmaps_dir,
                 &wrapped,
             );
-            let dest = apps_dir.join(format!("unipkg-{}-{}", meta.package, file_name));
+            let dest = apps_dir.join(format!("univ-{}-{}", meta.package, file_name));
             match write_desktop(&dest, &rewritten) {
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("unipkg: warning: cannot write {file_name}: {e}");
+                    eprintln!("univ: warning: cannot write {file_name}: {e}");
                     continue;
                 }
             }
@@ -109,7 +109,7 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
             for c in copies {
                 if let Err(e) = copy_icon_file(&c.source, &c.dest) {
                     eprintln!(
-                        "unipkg: warning: cannot install icon {}: {e}",
+                        "univ: warning: cannot install icon {}: {e}",
                         c.source.display()
                     );
                     continue;
@@ -140,7 +140,7 @@ fn refresh_desktop_db(apps_dir: &Path) {
         };
         if !output.status.success() {
             eprintln!(
-                "unipkg: warning: {tool}: {}",
+                "univ: warning: {tool}: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -188,7 +188,42 @@ pub fn unlink(package: &str) -> io::Result<usize> {
     Ok(removed)
 }
 
-pub fn uninstall(package: &str) -> io::Result<(usize, usize)> {
+fn required_by(installed: &[crate::resolve::Installed], name: &str) -> Vec<String> {
+    installed
+        .iter()
+        .filter(|p| {
+            p.meta.depends.iter().flatten().any(|d| {
+                d.package.split(':').next().unwrap_or("") == name
+            })
+        })
+        .map(|p| p.meta.package.clone())
+        .collect()
+}
+
+fn remove_orphans(store: &Store) -> Vec<String> {
+    let mut removed = Vec::new();
+    loop {
+        let installed = crate::resolve::installed_packages(store);
+        let orphan = installed.iter().find(|p| {
+            crate::store::is_auto(&p.sp)
+                && required_by(&installed, &p.meta.package).is_empty()
+        });
+        let Some(orphan) = orphan else {
+            break;
+        };
+        let sp = orphan.sp.clone();
+        let name = orphan.meta.package.clone();
+        let _ = remove_artifacts(&sp);
+        if let Ok(state) = Store::state_dir() {
+            let _ = fs::remove_dir_all(state.join(sp.to_string()));
+        }
+        let _ = fs::remove_dir_all(store.base().join(sp.to_string()));
+        removed.push(name);
+    }
+    removed
+}
+
+pub fn uninstall(package: &str) -> io::Result<(usize, usize, Vec<String>)> {
     let (pkg, arch) = match package.rsplit_once(':') {
         Some((p, a)) => (p, Some(a)),
         None => (package, None),
@@ -231,7 +266,7 @@ pub fn uninstall(package: &str) -> io::Result<(usize, usize)> {
             .collect();
         if !still_needed.is_empty() {
             eprintln!(
-                "unipkg: warning: {} is still required by {}",
+                "univ: warning: {} is still required by {}",
                 sp.name(),
                 still_needed.join(", ")
             );
@@ -240,13 +275,15 @@ pub fn uninstall(package: &str) -> io::Result<(usize, usize)> {
         removed += 1;
     }
 
-    if linked == 0 && removed == 0 {
+    let orphans = remove_orphans(&store);
+
+    if linked == 0 && removed == 0 && orphans.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("no installed package matching '{package}'"),
         ));
     }
-    Ok((linked, removed))
+    Ok((linked, removed, orphans))
 }
 
 pub fn remove_artifacts(sp: &StorePath) -> io::Result<usize> {
@@ -514,14 +551,13 @@ fn collect_icon_dir(
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if stem == name {
-                if let Ok(rel) = path.strip_prefix(theme_root) {
+            if stem == name
+                && let Ok(rel) = path.strip_prefix(theme_root) {
                     out.push(IconCopy {
                         dest: icons_dir.join(rel),
                         source: path,
                     });
                 }
-            }
         }
     }
 }
@@ -538,7 +574,7 @@ fn write_manifest(sp: &StorePath, entries: &[(char, PathBuf, PathBuf)]) -> io::R
     let dir = Store::state_dir()?.join(sp.to_string());
     fs::create_dir_all(&dir)?;
     let mut f = fs::File::create(dir.join("links"))?;
-    writeln!(f, "# unipkg link manifest v1")?;
+    writeln!(f, "# univ link manifest v1")?;
     for (kind, dest, source) in entries {
         writeln!(f, "{kind}\t{}\t{}", dest.display(), source.display())?;
     }
@@ -548,6 +584,7 @@ fn write_manifest(sp: &StorePath, entries: &[(char, PathBuf, PathBuf)]) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deb::Dep;
 
     fn test_home(root: &Path, label: &str) -> PathBuf {
         let home = root.join(label);
@@ -594,7 +631,7 @@ mod tests {
     fn with_env<F: FnOnce(&Store, &Path) -> io::Result<()>>(label: &str, f: F) {
         let _g = crate::store::TEST_HOME_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!(
-            "unipkg-link-test-{label}-{}",
+            "univ-link-test-{label}-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&tmp);
@@ -603,12 +640,12 @@ mod tests {
         fs::create_dir_all(store.base()).unwrap();
         let home = test_home(&tmp, "home");
         let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
+        unsafe { std::env::set_var("HOME", &home) };
         let result = f(&store, &home);
         if let Some(old) = old_home {
-            std::env::set_var("HOME", old);
+            unsafe { std::env::set_var("HOME", old) };
         } else {
-            std::env::remove_var("HOME");
+            unsafe { std::env::remove_var("HOME") };
         }
         fs::remove_dir_all(&tmp).unwrap();
         result.unwrap();
@@ -629,7 +666,7 @@ mod tests {
                 store.base().join(sp.to_string()).join("usr/bin/foo")
             );
 
-            let desktop = home.join(".local/share/applications/unipkg-hello-foo.desktop");
+            let desktop = home.join(".local/share/applications/univ-hello-foo.desktop");
             let text = fs::read_to_string(&desktop).unwrap();
             assert!(text.ends_with('\n'), "desktop file must end with newline");
             use std::os::unix::fs::MetadataExt;
@@ -638,7 +675,7 @@ mod tests {
                 0,
                 "desktop file must be executable for GNOME"
             );
-            assert!(text.contains("Name=Foo Bar (univpkg)"), "{text}");
+            assert!(text.contains("Name=Foo Bar (univ)"), "{text}");
             let store_bin = store.base().join(sp.to_string()).join("usr/bin/foo");
             assert!(
                 text.contains(&format!("Exec={} --new-window", store_bin.display())),
@@ -676,12 +713,75 @@ mod tests {
             let store_root = store.base().join(sp.to_string());
             assert!(store_root.is_dir());
 
-            let (links, paths) = uninstall("hello").unwrap();
+            let (links, paths, orphans) = uninstall("hello").unwrap();
             assert!(links >= 3, "removed {links} links");
             assert_eq!(paths, 1);
+            assert!(orphans.is_empty());
             assert!(!store_root.exists());
             assert!(!home.join(".local/bin/foo").exists());
             assert!(!Store::state_dir().unwrap().join(sp.to_string()).exists());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn uninstall_removes_orphaned_dependencies() {
+        with_env("uninstall-orphans", |_store, _home| {
+            let store = Store::init().unwrap();
+
+            let sp_app = StorePath::parse(&format!("{}-app", "a".repeat(64))).unwrap();
+            let sp_lib = StorePath::parse(&format!("{}-lib", "b".repeat(64))).unwrap();
+            let sp_core = StorePath::parse(&format!("{}-core", "c".repeat(64))).unwrap();
+            let sp_manual = StorePath::parse(&format!("{}-manual", "d".repeat(64))).unwrap();
+
+            let meta_app = DebMeta {
+                package: "app".into(),
+                version: "1.0".into(),
+                architecture: "all".into(),
+                depends: vec![vec![Dep::package_only("lib")]],
+                ..Default::default()
+            };
+            let meta_lib = DebMeta {
+                package: "lib".into(),
+                version: "2.0".into(),
+                architecture: "all".into(),
+                depends: vec![vec![Dep::package_only("core")]],
+                ..Default::default()
+            };
+            let meta_core = DebMeta {
+                package: "core".into(),
+                version: "3.0".into(),
+                architecture: "all".into(),
+                ..Default::default()
+            };
+            let meta_manual = DebMeta {
+                package: "manual".into(),
+                version: "1.0".into(),
+                architecture: "all".into(),
+                depends: vec![vec![Dep::package_only("core")]],
+                ..Default::default()
+            };
+
+            for (sp, meta) in [(&sp_app, &meta_app), (&sp_lib, &meta_lib), (&sp_core, &meta_core), (&sp_manual, &meta_manual)] {
+                fs::create_dir_all(store.base().join(sp.to_string())).unwrap();
+                crate::deb::write_meta(meta, sp).unwrap();
+            }
+            crate::store::mark_manual(&sp_app).unwrap();
+            crate::store::mark_auto(&sp_lib).unwrap();
+            crate::store::mark_auto(&sp_core).unwrap();
+            crate::store::mark_manual(&sp_manual).unwrap();
+
+            let (links, paths, orphans) = uninstall("app").unwrap();
+            assert_eq!(links, 0);
+            assert_eq!(paths, 1);
+            assert_eq!(orphans, vec!["lib".to_string()]);
+            assert!(!store.base().join(sp_app.to_string()).exists());
+            assert!(!store.base().join(sp_lib.to_string()).exists());
+            assert!(
+                store.base().join(sp_core.to_string()).is_dir(),
+                "core must stay: manual still depends on it"
+            );
+            assert!(store.base().join(sp_manual.to_string()).is_dir());
             Ok(())
         });
     }
@@ -699,9 +799,10 @@ mod tests {
                 crate::deb::write_meta(&m, sp).unwrap();
             }
 
-            let (links, paths) = uninstall("hello:i386").unwrap();
+            let (links, paths, orphans) = uninstall("hello:i386").unwrap();
             assert_eq!(links, 0);
             assert_eq!(paths, 1, "only the i386 store path is removed");
+            assert!(orphans.is_empty());
             assert!(!store.base().join(sp32.to_string()).exists());
             assert!(
                 store.base().join(sp64.to_string()).is_dir(),

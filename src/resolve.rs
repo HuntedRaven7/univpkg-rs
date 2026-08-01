@@ -143,11 +143,10 @@ pub fn resolve_binary(binary: &Path, installed: &[Installed]) -> Vec<ResolvedLib
 pub fn store_lib_dirs(deps: &[ResolvedLib]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for d in deps {
-        if let LibSource::Store { dir, .. } = &d.source {
-            if !out.contains(dir) {
+        if let LibSource::Store { dir, .. } = &d.source
+            && !out.contains(dir) {
                 out.push(dir.clone());
             }
-        }
     }
     out
 }
@@ -207,7 +206,7 @@ mod tests {
     #[test]
     fn resolves_against_installed_store_package() {
         let tmp = std::env::temp_dir().join(format!(
-            "unipkg-resolve-test-{}",
+            "univ-resolve-test-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&tmp);
@@ -253,7 +252,7 @@ mod tests {
     #[test]
     fn amd64_binary_ignores_i386_lib_with_same_soname() {
         let tmp = std::env::temp_dir().join(format!(
-            "unipkg-resolve-arch-{}",
+            "univ-resolve-arch-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&tmp);
@@ -310,7 +309,7 @@ mod tests {
     #[test]
     fn missing_libs_are_reported() {
         let tmp = std::env::temp_dir().join(format!(
-            "unipkg-resolve-missing-{}",
+            "univ-resolve-missing-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&tmp);

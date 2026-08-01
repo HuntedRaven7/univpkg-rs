@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const STORE_DIR: &str = "unipkg";
+const STORE_DIR: &str = "univ";
 const STORE_NAME: &str = "store";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -53,7 +53,7 @@ impl Store {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
-                    "no store at {} (run `unipkg init` first)",
+                    "no store at {} (run `univ init` first)",
                     base.display()
                 ),
             ));
@@ -77,6 +77,17 @@ impl Store {
 
     pub fn state_dir() -> io::Result<PathBuf> {
         Ok(Self::root()?.join("state"))
+    }
+
+    pub fn tmp_dir(&self) -> io::Result<PathBuf> {
+        let d = std::env::temp_dir().join(format!(
+            "univ-xz-{}-{}",
+            std::process::id(),
+            &sha256_hex(self.base.to_string_lossy().as_bytes())[..12]
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d)?;
+        Ok(d)
     }
 
     pub fn base(&self) -> &Path {
@@ -146,6 +157,25 @@ impl Store {
         out.sort();
         Ok(out)
     }
+}
+
+pub fn mark_auto(sp: &StorePath) -> io::Result<()> {
+    let dir = Store::state_dir()?.join(sp.to_string());
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("auto"), "")
+}
+
+pub fn mark_manual(sp: &StorePath) -> io::Result<()> {
+    let marker = Store::state_dir()?.join(sp.to_string()).join("auto");
+    let _ = fs::remove_file(&marker);
+    Ok(())
+}
+
+pub fn is_auto(sp: &StorePath) -> bool {
+    Store::state_dir()
+        .ok()
+        .map(|d| d.join(sp.to_string()).join("auto").is_file())
+        .unwrap_or(false)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -342,7 +372,7 @@ mod tests {
 
     #[test]
     fn store_add_is_content_addressed() {
-        let tmp = std::env::temp_dir().join(format!("unipkg-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("univ-test-{}", std::process::id()));
         let store = Store { base: tmp.clone() };
         fs::create_dir_all(&tmp).unwrap();
 
