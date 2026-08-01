@@ -584,15 +584,15 @@ mod tests {
         out.push(0);
         let after = 110 + namesize;
         let pad = (4 - after % 4) % 4;
-        out.extend(std::iter::repeat(0u8).take(pad));
+        out.extend(std::iter::repeat_n(0u8, pad));
         out.extend_from_slice(data);
         let data_pad = (4 - filesize % 4) % 4;
-        out.extend(std::iter::repeat(0u8).take(data_pad));
+        out.extend(std::iter::repeat_n(0u8, data_pad));
     }
 
     fn store_for_test(label: &str) -> (std::path::PathBuf, Store) {
         let dir = std::env::temp_dir()
-            .join(format!("unipkg-rpm-test-{}-{label}", std::process::id()));
+            .join(format!("univ-rpm-test-{}-{label}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let store = crate::store::test_store(&dir);

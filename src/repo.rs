@@ -223,7 +223,8 @@ pub fn update(repo: &Repo) -> io::Result<usize> {
                 "{}/dists/{}/{}/binary-{}/Packages",
                 repo.base, DIST, component, arch
             );
-            match fetch_index(&base) {
+            let label = format!("{} ({component}/{arch} Packages)", repo.name);
+            match fetch_index(&base, &label) {
                 Ok((text, _)) => {
                     let sub = parse_index(&text);
                     fetched += 1;
@@ -245,16 +246,18 @@ pub fn update(repo: &Repo) -> io::Result<usize> {
         let n = index.by_name.values().map(|v| v.len()).sum::<usize>();
         println!(
             "{} ({arch}): {} packages across {} components",
-            repo.name, n, fetched
+            crate::term::cyan(&repo.name),
+            n,
+            fetched
         );
     }
     Ok(total)
 }
 
-fn fetch_index(base: &str) -> io::Result<(String, String)> {
+fn fetch_index(base: &str, label: &str) -> io::Result<(String, String)> {
     let mut last_err: Option<io::Error> = None;
     for ext in ["xz", "gz", ""] {
-        match fetch_index_ext(base, ext) {
+        match fetch_index_ext(base, ext, label) {
             Ok(v) => return Ok(v),
             Err(e) => last_err = Some(e),
         }
@@ -263,13 +266,13 @@ fn fetch_index(base: &str) -> io::Result<(String, String)> {
         .unwrap_or_else(|| io::Error::other("no Packages index available")))
 }
 
-fn fetch_index_ext(base: &str, ext: &str) -> io::Result<(String, String)> {
+fn fetch_index_ext(base: &str, ext: &str, label: &str) -> io::Result<(String, String)> {
     let url = if ext.is_empty() {
         base.to_string()
     } else {
         format!("{base}.{ext}")
     };
-    let bytes = http_get(&url)?;
+    let bytes = crate::term::http_get(&url, label, None)?;
     let text = match ext {
         "xz" => {
             let mut out = Vec::new();
@@ -313,12 +316,11 @@ fn parse_stanza(lines: &[&str]) -> Option<Package> {
     let mut cur: Option<&str> = None;
     for line in lines {
         if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some(k) = cur {
-                if let Some(v) = map.get_mut(k) {
+            if let Some(k) = cur
+                && let Some(v) = map.get_mut(k) {
                     v.push('\n');
                     v.push_str(line.trim_start());
                 }
-            }
         } else if let Some((k, v)) = line.split_once(':') {
             let k = k.trim();
             map.insert(k, v.trim().to_string());
@@ -418,7 +420,7 @@ fn read_index(repo: &Repo) -> io::Result<Index> {
     }
     if missing == repo.arches.len() {
         return Err(io::Error::other(format!(
-            "no index for repo '{}'; run `unipkg update`",
+            "no index for repo '{}'; run `univ update`",
             repo.name
         )));
     }
@@ -445,7 +447,7 @@ pub fn search(repo: &Repo, query: &str) -> Vec<Package> {
 
 pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StorePath, DebMeta)>> {
     let index = read_index(repo)
-        .map_err(|_| io::Error::other(format!("no index for repo '{}'; run `unipkg update`", repo.name)))?;
+        .map_err(|_| io::Error::other(format!("no index for repo '{}'; run `univ update`", repo.name)))?;
     let installed = resolve::installed_packages(store);
 
     let (pkg_name, pkg_arch) = split_name_arch(name);
@@ -463,10 +465,13 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
     )?;
 
     let mut out = Vec::new();
-    for pkg in &plan {
-        println!("  downloading {}-{} [{}]", pkg.package, pkg.version, pkg.architecture);
+    for (i, pkg) in plan.iter().enumerate() {
+        let label = format!(
+            "downloading {}-{} [{}]",
+            pkg.package, pkg.version, pkg.architecture
+        );
         let url = format!("{}/{}", repo.base, pkg.filename);
-        let bytes = http_get(&url)?;
+        let bytes = crate::term::http_get(&url, &label, None)?;
         if let Some(expected) = &pkg.sha256 {
             let got = sha256_hex(&bytes);
             if !got.eq_ignore_ascii_case(expected) {
@@ -478,7 +483,19 @@ pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StoreP
         }
         let (sp, meta) = deb::install(store, &bytes)?;
         deb::write_meta(&meta, &sp)?;
+        if i + 1 == plan.len() {
+            crate::store::mark_manual(&sp)?;
+        } else {
+            crate::store::mark_auto(&sp)?;
+        }
         out.push((sp, meta));
+    }
+    if out.is_empty()
+        && let Some(p) = installed
+            .iter()
+            .find(|p| p.meta.package == pkg_name)
+    {
+        crate::store::mark_manual(&p.sp)?;
     }
     Ok(out)
 }
@@ -621,16 +638,6 @@ fn constraint_ok(version: &str, c: Option<&(String, String)>) -> bool {
     match c {
         None => true,
         Some((op, req)) => version::satisfies(version, op, req),
-    }
-}
-
-fn http_get(url: &str) -> io::Result<Vec<u8>> {
-    match ureq::get(url).call() {
-        Ok(res) => res.into_body().read_to_vec().map_err(io::Error::other),
-        Err(ureq::Error::StatusCode(404)) => {
-            Err(io::Error::new(io::ErrorKind::NotFound, format!("{url}: not found")))
-        }
-        Err(e) => Err(io::Error::other(format!("{url}: {e}"))),
     }
 }
 
@@ -810,20 +817,20 @@ mod tests {
         let _g = crate::store::TEST_HOME_LOCK.lock().unwrap();
 
         let tmp = std::env::temp_dir().join(format!(
-            "unipkg-search-test-{}",
+            "univ-search-test-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        unsafe { std::env::set_var("HOME", &tmp) };
 
         let repo = Repo {
             name: "debian".into(),
             base: "http://example.invalid/debian".into(),
             arches: vec!["amd64".into()],
         };
-        let cache_dir = tmp.join(".local/unipkg/cache");
+        let cache_dir = tmp.join(".local/univ/cache");
         fs::create_dir_all(&cache_dir).unwrap();
         fs::write(
             cache_dir.join("debian.Packages.amd64"),
@@ -860,9 +867,9 @@ Description: Steam dependencies
         assert!(search(&repo, "zzz-nothing").is_empty());
 
         if let Some(old) = old_home {
-            std::env::set_var("HOME", old);
+            unsafe { std::env::set_var("HOME", old) };
         } else {
-            std::env::remove_var("HOME");
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(&tmp);
     }

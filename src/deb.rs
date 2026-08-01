@@ -30,19 +30,20 @@ impl Dep {
 }
 
 pub fn install(store: &Store, deb: &[u8]) -> io::Result<(StorePath, DebMeta)> {
-    if let Some((_, v)) = member(deb, "debian-binary")? {
-        if String::from_utf8_lossy(&v).trim() != "2.0" {
+    if let Some((_, v)) = member(deb, "debian-binary")?
+        && String::from_utf8_lossy(&v).trim() != "2.0" {
             return Err(invalid("unsupported debian-binary format"));
         }
-    }
 
     let (control_name, control) = member(deb, "control.tar")?
         .ok_or_else(|| invalid("no control.tar member in archive"))?;
     let (data_name, data) = member(deb, "data.tar")?
         .ok_or_else(|| invalid("no data.tar member in archive"))?;
 
+    let tmp = store.tmp_dir()?;
     let meta = read_control(&control_name, &control)?;
     if meta.package.is_empty() || meta.version.is_empty() {
+        let _ = fs::remove_dir_all(&tmp);
         return Err(invalid("control file missing Package or Version"));
     }
     let name = {
@@ -56,7 +57,11 @@ pub fn install(store: &Store, deb: &[u8]) -> io::Result<(StorePath, DebMeta)> {
         }
     };
 
-    let sp = store.add_tree(&name, |dir, ctx| unpack_data(&data_name, &data, dir, ctx))?;
+    let result = store.add_tree(&name, |dir, ctx| {
+        unpack_data(&data_name, &data, dir, ctx, &tmp)
+    });
+    let _ = fs::remove_dir_all(&tmp);
+    let sp = result?;
     Ok((sp, meta))
 }
 
@@ -79,14 +84,15 @@ fn unpack_data(
     bytes: &[u8],
     dir: &Path,
     ctx: &mut Sha256,
+    tmp: &Path,
 ) -> io::Result<()> {
-    let mut reader = open_payload(name, bytes)?;
+    let mut reader = open_payload(name, bytes, tmp)?;
     let mut archive = tar::Archive::new(HashingReader::new(&mut reader, ctx));
     archive.unpack(dir)?;
     Ok(())
 }
 
-fn open_payload<'a>(name: &str, bytes: &'a [u8]) -> io::Result<Box<dyn Read + 'a>> {
+fn open_payload<'a>(name: &str, bytes: &'a [u8], tmp: &Path) -> io::Result<Box<dyn Read + 'a>> {
     let ext = name.rsplit('.').next().unwrap_or("");
     match ext {
         "gz" => Ok(Box::new(flate2::read::GzDecoder::new(Cursor::new(bytes)))),
@@ -95,9 +101,8 @@ fn open_payload<'a>(name: &str, bytes: &'a [u8]) -> io::Result<Box<dyn Read + 'a
                 .map_err(|e| invalid(format!("zstd: {e}")))?,
         )),
         "xz" => {
-            let payload = std::env::temp_dir().join(format!(
-                "unipkg-xz-{}-{}",
-                std::process::id(),
+            let payload = tmp.join(format!(
+                "payload-{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
@@ -360,7 +365,7 @@ mod tests {
 
     fn test_store(label: &str) -> (std::path::PathBuf, crate::store::Store) {
         let dir = std::env::temp_dir().join(format!(
-            "unipkg-deb-test-{}-{label}",
+            "univ-deb-test-{}-{label}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -431,17 +436,13 @@ mod tests {
     #[test]
     fn xz_payload_temp_file_is_removed() {
         let (dir, store) = test_store("xz-cleanup");
+        let tmp = store.tmp_dir().unwrap();
         let deb = make_deb("data.tar.xz", &tar_xz(&[("./usr/bin/hello", b"x", 0o755)]));
         install(&store, &deb).unwrap();
-        let leftovers: Vec<String> = std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("unipkg-xz-"))
-            .collect();
         assert!(
-            leftovers.is_empty(),
-            "xz temp payload leaked: {leftovers:?}"
+            !tmp.exists(),
+            "xz temp payload leaked at {}",
+            tmp.display()
         );
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -6,6 +6,7 @@ mod resolve;
 mod rpm;
 mod rpmrepo;
 mod store;
+mod term;
 mod version;
 
 use std::io;
@@ -16,12 +17,14 @@ struct SearchResult {
     version: String,
     architecture: String,
     kind: &'static str,
-    _repo: String,
+    repo: String,
     description: String,
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let json = args.iter().any(|a| a == "--json");
+    args.retain(|a| a != "--json");
 
     let command = match args.first() {
         None => {
@@ -36,42 +39,100 @@ fn main() -> ExitCode {
     };
 
     match command {
+        "--store" | "store" => run_store(),
         "init" => match store::Store::init() {
             Ok(s) => {
-                println!("initialized store at {}", s.base().display());
+                println!(
+                    "{} {}",
+                    term::bold_green("initialized"),
+                    term::cyan(&format!("store at {}", s.base().display()))
+                );
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("unipkg: {e}");
+                eprintln!("{}", term::error(&e.to_string()));
                 ExitCode::FAILURE
             }
         },
         "status" => match store::Store::open() {
             Ok(s) => {
-                println!("store: {}", s.base().display());
+                println!(
+                    "{} {}",
+                    term::bold("store:"),
+                    term::cyan(&s.base().display().to_string())
+                );
                 println!("store paths:");
                 for p in s.paths().unwrap_or_default() {
-                    println!("  {p}");
+                    println!("  {}", term::dim(&p.to_string()));
                 }
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("unipkg: {e}");
+                eprintln!("{}", term::error(&e.to_string()));
                 ExitCode::FAILURE
             }
         },
+        "list" => {
+            let store = match store::Store::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut installed = resolve::installed_packages(&store);
+            installed.sort_by(|a, b| {
+                a.meta
+                    .package
+                    .cmp(&b.meta.package)
+                    .then(a.meta.architecture.cmp(&b.meta.architecture))
+            });
+            if json {
+                let rows: Vec<serde_json::Value> = installed
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "name": p.meta.package,
+                            "version": p.meta.version,
+                            "architecture": p.meta.architecture,
+                            "description": p.meta.description,
+                            "depends": deb::render_depends(&p.meta.depends),
+                        })
+                    })
+                    .collect();
+                let out = serde_json::to_string(&rows)
+                    .unwrap_or_else(|_| "[]".to_string());
+                println!("{out}");
+                ExitCode::SUCCESS
+            } else {
+                if installed.is_empty() {
+                    println!("{}", term::dim("no packages installed"));
+                }
+                for p in &installed {
+                    let desc = p.meta.description.lines().next().unwrap_or("");
+                    println!(
+                        "{} {} {}  {}",
+                        term::bold_cyan(&p.meta.package),
+                        term::green(&p.meta.version),
+                        term::magenta(&p.meta.architecture),
+                        term::dim(desc)
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+        }
         "add" => {
             let file = match args.get(1) {
                 Some(f) => f,
                 None => {
-                    eprintln!("usage: unipkg add <file>");
+                    eprintln!("usage: univ add <file>");
                     return ExitCode::FAILURE;
                 }
             };
             let bytes = match std::fs::read(file) {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     return ExitCode::FAILURE;
                 }
             };
@@ -85,11 +146,15 @@ fn main() -> ExitCode {
             });
             match result {
                 Ok((s, p)) => {
-                    println!("added {}", s.base().join(p.to_string()).display());
+                    println!(
+                        "{} {}",
+                        term::bold_green("added"),
+                        term::cyan(&s.base().join(p.to_string()).display().to_string())
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     ExitCode::FAILURE
                 }
             }
@@ -97,17 +162,23 @@ fn main() -> ExitCode {
         "add-repo" => {
             let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
             if rest.len() < 2 {
-                eprintln!("usage: unipkg add-repo <name> <base-url> [arch ...]");
+                eprintln!("usage: univ add-repo <name> <base-url> [arch ...]");
                 return ExitCode::FAILURE;
             }
             let (name, base, arches) = parse_repo_args(&rest);
             match repo::add_repo(&name, &base, &arches) {
                 Ok(()) => {
-                    println!("added deb repo '{name}' -> {base}");
+                    println!(
+                        "{} {} {} {}",
+                        term::bold_green("added"),
+                        term::bold("deb repo"),
+                        term::bold_cyan(&format!("'{name}'")),
+                        term::dim(&format!("-> {base}"))
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     ExitCode::FAILURE
                 }
             }
@@ -115,17 +186,23 @@ fn main() -> ExitCode {
         "add-rpm-repo" => {
             let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
             if rest.len() < 2 {
-                eprintln!("usage: unipkg add-rpm-repo <name> <base-url> [arch ...]");
+                eprintln!("usage: univ add-rpm-repo <name> <base-url> [arch ...]");
                 return ExitCode::FAILURE;
             }
             let (name, base, arches) = parse_repo_args(&rest);
             match rpmrepo::add_repo(&name, &base, &arches) {
                 Ok(()) => {
-                    println!("added rpm repo '{name}' -> {base}");
+                    println!(
+                        "{} {} {} {}",
+                        term::bold_green("added"),
+                        term::bold("rpm repo"),
+                        term::bold_cyan(&format!("'{name}'")),
+                        term::dim(&format!("-> {base}"))
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     ExitCode::FAILURE
                 }
             }
@@ -134,13 +211,13 @@ fn main() -> ExitCode {
             let repos = match repo::repos() {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     return ExitCode::FAILURE;
                 }
             };
             for r in &repos {
                 if let Err(e) = repo::update(r) {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     return ExitCode::FAILURE;
                 }
             }
@@ -150,7 +227,7 @@ fn main() -> ExitCode {
             let arg = match args.get(1) {
                 Some(f) => f,
                 None => {
-                    eprintln!("usage: unipkg install <file.deb | file.rpm | package>");
+                    eprintln!("usage: univ install <file.deb | file.rpm | package>");
                     return ExitCode::FAILURE;
                 }
             };
@@ -166,7 +243,7 @@ fn main() -> ExitCode {
             let arg = match args.get(1) {
                 Some(f) => f,
                 None => {
-                    eprintln!("usage: unipkg install-deb <package>");
+                    eprintln!("usage: univ install-deb <package>");
                     return ExitCode::FAILURE;
                 }
             };
@@ -176,7 +253,7 @@ fn main() -> ExitCode {
             let arg = match args.get(1) {
                 Some(f) => f,
                 None => {
-                    eprintln!("usage: unipkg install-rpm <package | file.rpm>");
+                    eprintln!("usage: univ install-rpm <package | file.rpm>");
                     return ExitCode::FAILURE;
                 }
             };
@@ -189,13 +266,13 @@ fn main() -> ExitCode {
             let repos = match rpmrepo::repos() {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     return ExitCode::FAILURE;
                 }
             };
             for r in &repos {
                 if let Err(e) = rpmrepo::update(r) {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     return ExitCode::FAILURE;
                 }
             }
@@ -205,7 +282,7 @@ fn main() -> ExitCode {
             let query = match args.get(1) {
                 Some(q) => q,
                 None => {
-                    eprintln!("usage: unipkg search <query>");
+                    eprintln!("usage: univ search <query>");
                     return ExitCode::FAILURE;
                 }
             };
@@ -218,7 +295,7 @@ fn main() -> ExitCode {
                             version: p.version,
                             architecture: p.architecture,
                             kind: "deb",
-                            _repo: r.name.clone(),
+                            repo: r.name.clone(),
                             description: p.description,
                         });
                     }
@@ -232,7 +309,7 @@ fn main() -> ExitCode {
                             version: p.full_version,
                             architecture: p.architecture,
                             kind: "rpm",
-                            _repo: r.name.clone(),
+                            repo: r.name.clone(),
                             description: p.description,
                         });
                     }
@@ -251,46 +328,52 @@ fn main() -> ExitCode {
                     && a.kind == b.kind
             });
             if results.is_empty() {
-                println!("no packages match '{query}'");
+                println!("{}", term::yellow(&format!("no packages match '{query}'")));
                 return ExitCode::FAILURE;
             }
             let shown = results.len().min(100);
+            if json {
+                let rows: Vec<serde_json::Value> = results[..shown]
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "name": p.package,
+                            "version": p.version,
+                            "architecture": p.architecture,
+                            "kind": p.kind,
+                            "repo": p.repo,
+                            "description": p.description,
+                        })
+                    })
+                    .collect();
+                let out =
+                    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+                println!("{out}");
+                return ExitCode::SUCCESS;
+            }
             for p in &results[..shown] {
-
-                const RESET: &str = "\x1b[0m";
-                const BOLD_CYAN: &str = "\x1b[1;36m";
-                const GREEN: &str = "\x1b[32m";
-                const YELLOW: &str = "\x1b[33m";
-                const MAGENTA: &str = "\x1b[35m";
-                const DIM: &str = "\x1b[2m";
                 let desc_part = if p.description.is_empty() {
                     String::new()
                 } else {
-                    format!(" - {}{}{}", DIM, p.description, RESET)
+                    format!(" - {}", term::dim(&p.description))
                 };
-
-                let (pkg_color, ver_color) = if p.kind == "rpm" {
-                    (YELLOW, GREEN)
+                let pkg = if p.kind == "rpm" {
+                    term::yellow(&p.package)
                 } else {
-                    (BOLD_CYAN, GREEN)
+                    term::bold_cyan(&p.package)
                 };
                 println!(
-                    "{}{}{} {}{}{} [{}] {}{}{}{}",
-                    pkg_color,
-                    p.package,
-                    RESET,
-                    ver_color,
-                    p.version,
-                    RESET,
-                    p.architecture,
-                    MAGENTA,
-                    p.kind,
-                    RESET,
-                    desc_part
+                    "{pkg} {} [{}] {}{desc_part}",
+                    term::green(&p.version),
+                    term::magenta(&p.architecture),
+                    term::magenta(p.kind),
                 );
             }
             if results.len() > shown {
-                println!("... and {} more", results.len() - shown);
+                println!(
+                    "{}",
+                    term::dim(&format!("... and {} more", results.len() - shown))
+                );
             }
             ExitCode::SUCCESS
         }
@@ -298,14 +381,14 @@ fn main() -> ExitCode {
             let package = match args.get(1) {
                 Some(p) => p,
                 None => {
-                    eprintln!("usage: unipkg deps <package>");
+                    eprintln!("usage: univ deps <package>");
                     return ExitCode::FAILURE;
                 }
             };
             let store = match store::Store::open() {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     return ExitCode::FAILURE;
                 }
             };
@@ -313,7 +396,7 @@ fn main() -> ExitCode {
             let pkg = match find_installed(&installed, package) {
                 Some(p) => p,
                 None => {
-                    eprintln!("unipkg: no installed package matching '{package}'");
+                    eprintln!("{}", term::error(&format!("no installed package matching '{package}'")));
                     return ExitCode::FAILURE;
                 }
             };
@@ -350,7 +433,7 @@ fn main() -> ExitCode {
             let store = match store::Store::open() {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     return ExitCode::FAILURE;
                 }
             };
@@ -361,34 +444,50 @@ fn main() -> ExitCode {
                 match link::link_package(&store, &pkg.sp, &pkg.meta) {
                     Ok(_) => {
                         relinked += 1;
-                        println!("relinked {}", pkg.meta.package);
+                        println!(
+                            "{} {}",
+                            term::bold_green("relinked"),
+                            term::bold_cyan(&pkg.meta.package)
+                        );
                     }
                     Err(e) => eprintln!(
-                        "unipkg: warning: relink {}: {e}",
-                        pkg.meta.package
+                        "{}",
+                        term::warn(&format!("warning: relink {}: {e}", pkg.meta.package))
                     ),
                 }
             }
-            println!("rehashed {relinked} package(s)");
+            println!(
+                "{}",
+                term::bold(&format!("rehashed {relinked} package(s)"))
+            );
             ExitCode::SUCCESS
         }
         "uninstall" => {
             let package = match args.get(1) {
                 Some(p) => p,
                 None => {
-                    eprintln!("usage: unipkg uninstall <package>");
+                    eprintln!("usage: univ uninstall <package>");
                     return ExitCode::FAILURE;
                 }
             };
             match link::uninstall(package) {
-                Ok((links, paths)) => {
+                Ok((links, paths, orphans)) => {
                     println!(
-                        "removed {links} link(s) and {paths} store path(s) for '{package}'"
+                        "{} {links} link(s) and {paths} store path(s) for {}",
+                        term::bold_green("removed"),
+                        term::bold_cyan(&format!("'{package}'"))
                     );
+                    if !orphans.is_empty() {
+                        println!(
+                            "{} {}",
+                            term::yellow("removed orphaned dependencies:"),
+                            orphans.join(", ")
+                        );
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     ExitCode::FAILURE
                 }
             }
@@ -397,33 +496,62 @@ fn main() -> ExitCode {
             let package = match args.get(1) {
                 Some(p) => p,
                 None => {
-                    eprintln!("usage: unipkg unlink <package>");
+                    eprintln!("usage: univ unlink <package>");
                     return ExitCode::FAILURE;
                 }
             };
             match store::Store::open().and_then(|_s| link::unlink(package)) {
                 Ok(n) => {
-                    println!("removed {n} link(s) for '{package}'");
+                    println!(
+                        "{} {n} link(s) for {}",
+                        term::bold_green("removed"),
+                        term::bold_cyan(&format!("'{package}'"))
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("unipkg: {e}");
+                    eprintln!("{}", term::error(&e.to_string()));
                     ExitCode::FAILURE
                 }
             }
         }
         other => {
-            eprintln!("unipkg: unknown command '{other}'");
+            eprintln!("{}", term::error(&format!("unknown command '{other}'")));
             ExitCode::FAILURE
         }
     }
 }
 
-fn install_package(arg: &str) -> ExitCode {
-    let store = match store::Store::open() {
+fn run_store() -> ExitCode {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let bin = if dir.join("univ-store").is_file() {
+        dir.join("univ-store")
+    } else {
+        std::path::PathBuf::from("univ-store")
+    };
+    match std::process::Command::new(bin).status() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => {
+            ExitCode::from(status.code().unwrap_or(1) as u8)
+        }
+        Err(e) => {
+            eprintln!("{}", term::error(&format!("failed to launch the store TUI: {e}")));
+            eprintln!(
+                "{}",
+                term::dim("hint: build it with `cargo build` (produces the `univ-store` binary)")
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn install_package(arg: &str) -> ExitCode {    let store = match store::Store::open() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             return ExitCode::FAILURE;
         }
     };
@@ -434,48 +562,57 @@ fn install_package(arg: &str) -> ExitCode {
     }) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             return ExitCode::FAILURE;
         }
     };
     match repo::install(&store, &repo, arg) {
         Ok(installed) => {
             for (sp, meta) in &installed {
-                println!(
-                    "installed {}-{} [{}]",
-                    meta.package, meta.version, meta.architecture
-                );
+                println!("{}", installed_line(meta));
                 let _ = link::link_package(&store, sp, meta);
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             ExitCode::FAILURE
         }
     }
 }
 
+fn installed_line(meta: &deb::DebMeta) -> String {
+    format!(
+        "{} {}-{} [{}]",
+        term::bold_green("installed"),
+        term::bold_cyan(&meta.package),
+        term::green(&meta.version),
+        term::magenta(&meta.architecture)
+    )
+}
+
 fn print_help() {
-    println!("unipkg - a content-addressed package manager");
+    println!("univ - a content-addressed package manager");
     println!();
-    println!("usage: unipkg <command> [args]");
+    println!("usage: univ <command> [args]");
     println!();
     println!("commands:");
-    println!("  init                    create the store at ~/.local/unipkg");
+    println!("  init                    create the store at ~/.local/univ");
+    println!("  store (or --store)      open the interactive store TUI (univ-store)");
     println!("  status                  list installed store paths");
+    println!("  list                    list installed packages (add --json for machine-readable)");
     println!();
     println!("  -- Debian / Ubuntu (APT/deb) --");
     println!("  update                  refresh the deb package index from repos");
-    println!("  add-repo <n> <url> [a…] append a deb repo to ~/.local/unipkg/debrepos.conf");
-    println!("  search <query>          search cached package indexes (deb & rpm)");
+    println!("  add-repo <n> <url> [a…] append a deb repo to ~/.local/univ/debrepos.conf");
+    println!("  search <query>          search cached package indexes (deb & rpm); add --json");
     println!("  install <file.deb>      install a .deb from disk");
     println!("  install <package>       install a deb package (with deps) from a repo");
     println!("  install-deb <package>   install a deb package by name");
     println!();
     println!("  -- Fedora / RPM (DNF/rpm) --");
     println!("  update-rpm              refresh the RPM package index from repos");
-    println!("  add-rpm-repo <n> <url>  append an RPM repo to ~/.local/unipkg/rpmrepos.conf");
+    println!("  add-rpm-repo <n> <url>  append an RPM repo to ~/.local/univ/rpmrepos.conf");
     println!("  install <file.rpm>      install a .rpm from disk");
     println!("  install-rpm <package>   install an RPM package (with deps) from a repo");
     println!("  install-rpm <file.rpm>  install a .rpm from disk");
@@ -485,67 +622,83 @@ fn print_help() {
     println!("  rehash                  rebuild launchers for all installed packages");
     println!("  unlink <package>        remove a package's launchers and desktop entries");
     println!("  uninstall <package>     remove a package's files, launchers and store path");
+    println!("                          (plus no-longer-needed dependencies)");
+}
+
+fn report_linked(linked: &link::Linked) {
+    if !linked.bin_links.is_empty() {
+        println!("{}", term::bold("linked into ~/.local/bin:"));
+        for b in &linked.bin_links {
+            println!("  {}", term::cyan(&b.display().to_string()));
+        }
+        let bin_dir = store::Store::home_dir()
+            .map(|h| h.join(".local").join("bin"))
+            .unwrap_or_default();
+        if !on_path(&bin_dir) {
+            println!(
+                "{}",
+                term::yellow(&format!(
+                    "note: {} is not on $PATH; add it to run these from a terminal",
+                    bin_dir.display()
+                ))
+            );
+        }
+    }
+    if !linked.desktop_files.is_empty() {
+        println!("{}", term::bold("desktop launchers:"));
+        for d in &linked.desktop_files {
+            println!("  {}", term::cyan(&d.display().to_string()));
+        }
+    }
+    if !linked.icons.is_empty() {
+        println!(
+            "{} {}",
+            term::bold("icons:"),
+            term::cyan(&linked.icons.len().to_string())
+        );
+    }
 }
 
 fn install_deb_file(file: &str) -> ExitCode {
     let bytes = match std::fs::read(file) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             return ExitCode::FAILURE;
         }
     };
     match store::Store::open().and_then(|s| {
         let (p, meta) = deb::install(&s, &bytes)?;
         deb::write_meta(&meta, &p)?;
+        store::mark_manual(&p)?;
         Ok((s, p, meta))
     }) {
         Ok((s, p, meta)) => {
+            println!("{}", installed_line(&meta));
             println!(
-                "installed {}-{} [{}]",
-                meta.package, meta.version, meta.architecture
+                "{} {}",
+                term::bold("store:"),
+                term::cyan(&s.base().join(p.to_string()).display().to_string())
             );
-            println!("store: {}", s.base().join(p.to_string()).display());
             if !meta.description.is_empty() {
                 let first = meta.description.lines().next().unwrap_or("");
-                println!("  {first}");
+                println!("  {}", term::dim(first));
             }
             if !meta.depends.is_empty() {
-                println!("  depends: {}", deb::render_depends(&meta.depends));
+                println!(
+                    "  {} {}",
+                    term::bold("depends:"),
+                    term::dim(&deb::render_depends(&meta.depends))
+                );
             }
             match link::link_package(&s, &p, &meta) {
-                Ok(linked) => {
-                    if !linked.bin_links.is_empty() {
-                        println!("linked into ~/.local/bin:");
-                        for b in &linked.bin_links {
-                            println!("  {}", b.display());
-                        }
-                        let bin_dir = store::Store::home_dir()
-                            .map(|h| h.join(".local").join("bin"))
-                            .unwrap_or_default();
-                        if !on_path(&bin_dir) {
-                            println!(
-                                "note: {} is not on $PATH; add it to run these from a terminal",
-                                bin_dir.display()
-                            );
-                        }
-                    }
-                    if !linked.desktop_files.is_empty() {
-                        println!("desktop launchers:");
-                        for d in &linked.desktop_files {
-                            println!("  {}", d.display());
-                        }
-                    }
-                    if !linked.icons.is_empty() {
-                        println!("icons: {}", linked.icons.len());
-                    }
-                }
-                Err(e) => eprintln!("unipkg: warning: integration failed: {e}"),
+                Ok(linked) => report_linked(&linked),
+                Err(e) => eprintln!("{}", term::warn(&format!("warning: integration failed: {e}"))),
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -555,7 +708,7 @@ fn install_rpm_file(file: &str) -> ExitCode {
     let bytes = match std::fs::read(file) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             return ExitCode::FAILURE;
         }
     };
@@ -563,51 +716,28 @@ fn install_rpm_file(file: &str) -> ExitCode {
         let (p, rpm_meta) = rpm::install(&s, &bytes)?;
         rpm::write_meta(&rpm_meta, &p)?;
         let meta: deb::DebMeta = rpm_meta.into();
+        store::mark_manual(&p)?;
         Ok((s, p, meta))
     }) {
         Ok((s, p, meta)) => {
+            println!("{}", installed_line(&meta));
             println!(
-                "installed {}-{} [{}]",
-                meta.package, meta.version, meta.architecture
+                "{} {}",
+                term::bold("store:"),
+                term::cyan(&s.base().join(p.to_string()).display().to_string())
             );
-            println!("store: {}", s.base().join(p.to_string()).display());
             if !meta.description.is_empty() {
                 let first = meta.description.lines().next().unwrap_or("");
-                println!("  {first}");
+                println!("  {}", term::dim(first));
             }
             match link::link_package(&s, &p, &meta) {
-                Ok(linked) => {
-                    if !linked.bin_links.is_empty() {
-                        println!("linked into ~/.local/bin:");
-                        for b in &linked.bin_links {
-                            println!("  {}", b.display());
-                        }
-                        let bin_dir = store::Store::home_dir()
-                            .map(|h| h.join(".local").join("bin"))
-                            .unwrap_or_default();
-                        if !on_path(&bin_dir) {
-                            println!(
-                                "note: {} is not on $PATH; add it to run these from a terminal",
-                                bin_dir.display()
-                            );
-                        }
-                    }
-                    if !linked.desktop_files.is_empty() {
-                        println!("desktop launchers:");
-                        for d in &linked.desktop_files {
-                            println!("  {}", d.display());
-                        }
-                    }
-                    if !linked.icons.is_empty() {
-                        println!("icons: {}", linked.icons.len());
-                    }
-                }
-                Err(e) => eprintln!("unipkg: warning: integration failed: {e}"),
+                Ok(linked) => report_linked(&linked),
+                Err(e) => eprintln!("{}", term::warn(&format!("warning: integration failed: {e}"))),
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -617,7 +747,7 @@ fn install_rpm_package(name: &str) -> ExitCode {
     let store = match store::Store::open() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             return ExitCode::FAILURE;
         }
     };
@@ -628,23 +758,20 @@ fn install_rpm_package(name: &str) -> ExitCode {
     }) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             return ExitCode::FAILURE;
         }
     };
     match rpmrepo::install(&store, &repo, name) {
         Ok(installed) => {
             for (sp, meta) in &installed {
-                println!(
-                    "installed {}-{} [{}]",
-                    meta.package, meta.version, meta.architecture
-                );
+                println!("{}", installed_line(meta));
                 let _ = link::link_package(&store, sp, meta);
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("unipkg: {e}");
+            eprintln!("{}", term::error(&e.to_string()));
             ExitCode::FAILURE
         }
     }

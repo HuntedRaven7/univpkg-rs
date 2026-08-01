@@ -210,7 +210,7 @@ pub fn update(repo: &FedoraRepo) -> io::Result<usize> {
     for arch in &repo.arches {
         let base = repo.base.trim_end_matches('/');
         let repomd_url = format!("{base}/repodata/repomd.xml");
-        let repomd_bytes = http_get(&repomd_url)?;
+        let repomd_bytes = crate::term::http_get(&repomd_url, "repomd.xml", Some(MAX_BODY))?;
         let repomd_text =
             String::from_utf8(repomd_bytes).map_err(io::Error::other)?;
 
@@ -227,7 +227,12 @@ pub fn update(repo: &FedoraRepo) -> io::Result<usize> {
             format!("{base}/{}", primary_href.trim_start_matches('/'))
         };
 
-        let primary_bytes = http_get(&primary_url)?;
+        let primary_label = primary_url
+            .rsplit('/')
+            .next()
+            .unwrap_or("primary")
+            .to_string();
+        let primary_bytes = crate::term::http_get(&primary_url, &primary_label, Some(MAX_BODY))?;
         let primary_text = decompress_primary(&primary_url, &primary_bytes)?;
 
         let index = parse_primary(&primary_text);
@@ -239,7 +244,10 @@ pub fn update(repo: &FedoraRepo) -> io::Result<usize> {
         }
         fs::write(&path, render_index(&index))?;
 
-        println!("{} ({arch}): {n} packages", repo.name);
+        println!(
+            "{} ({arch}): {n} packages",
+            crate::term::cyan(&repo.name)
+        );
         total += n;
     }
     Ok(total)
@@ -256,11 +264,10 @@ fn find_primary_href(repomd: &str) -> Option<String> {
         if in_primary && t.contains("</data>") {
             break;
         }
-        if in_primary {
-            if let Some(href) = extract_attr(t, "location", "href") {
+        if in_primary
+            && let Some(href) = extract_attr(t, "location", "href") {
                 return Some(href);
             }
-        }
     }
     None
 }
@@ -327,11 +334,10 @@ fn parse_primary(text: &str) -> Index {
             in_req = true;
         } else if t.starts_with("</requires>") {
             in_req = false;
-        } else if in_req && (t.starts_with("<entry ") || t.starts_with("<rpm:entry ")) {
-            if let Some(dep) = parse_dep_entry(t) {
+        } else if in_req && (t.starts_with("<entry ") || t.starts_with("<rpm:entry "))
+            && let Some(dep) = parse_dep_entry(t) {
                 pkg.requires.push(vec![dep]);
             }
-        }
     }
 
     index
@@ -449,14 +455,12 @@ fn parse_index(text: &str) -> Index {
             let k = k.trim();
             stanza.insert(k, v.trim().to_string());
             cur_key = Some(k);
-        } else if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some(k) = cur_key {
-                if let Some(v) = stanza.get_mut(k) {
+        } else if (line.starts_with(' ') || line.starts_with('\t'))
+            && let Some(k) = cur_key
+                && let Some(v) = stanza.get_mut(k) {
                     v.push('\n');
                     v.push_str(line.trim_start());
                 }
-            }
-        }
     }
     flush(&mut stanza);
     index
@@ -513,7 +517,7 @@ fn read_index(repo: &FedoraRepo) -> io::Result<Index> {
     }
     if missing == repo.arches.len() {
         return Err(io::Error::other(format!(
-            "no index for repo '{}'; run `unipkg update-rpm`",
+            "no index for repo '{}'; run `univ update-rpm`",
             repo.name
         )));
     }
@@ -527,7 +531,7 @@ pub fn install(
 ) -> io::Result<Vec<(StorePath, DebMeta)>> {
     let index = read_index(repo).map_err(|_| {
         io::Error::other(format!(
-            "no index for repo '{}'; run `unipkg update-rpm`",
+            "no index for repo '{}'; run `univ update-rpm`",
             repo.name
         ))
     })?;
@@ -538,9 +542,9 @@ pub fn install(
     plan_package(&installed, &index, name, None, None, &mut plan, &mut planned)?;
 
     let mut out = Vec::new();
-    for pkg in &plan {
-        println!(
-            "  downloading {}-{} [{}]",
+    for (i, pkg) in plan.iter().enumerate() {
+        let label = format!(
+            "downloading {}-{} [{}]",
             pkg.package, pkg.full_version, pkg.architecture
         );
         let base = repo.base.trim_end_matches('/');
@@ -549,7 +553,7 @@ pub fn install(
         } else {
             format!("{base}/{}", pkg.location.trim_start_matches('/'))
         };
-        let bytes = http_get(&url)?;
+        let bytes = crate::term::http_get(&url, &label, Some(MAX_BODY))?;
         if let Some(expected) = &pkg.sha256 {
             let got = sha256_hex(&bytes);
             if !got.eq_ignore_ascii_case(expected) {
@@ -561,8 +565,18 @@ pub fn install(
         }
         let (sp, rpm_meta) = rpm::install(store, &bytes)?;
         rpm::write_meta(&rpm_meta, &sp)?;
+        if i + 1 == plan.len() {
+            crate::store::mark_manual(&sp)?;
+        } else {
+            crate::store::mark_auto(&sp)?;
+        }
         let deb_meta: DebMeta = rpm_meta.into();
         out.push((sp, deb_meta));
+    }
+    if out.is_empty()
+        && let Some(p) = installed.iter().find(|p| p.meta.package == name)
+    {
+        crate::store::mark_manual(&p.sp)?;
     }
     Ok(out)
 }
@@ -656,23 +670,7 @@ fn constraint_ok(version: &str, c: Option<&(String, String)>) -> bool {
     }
 }
 
-fn http_get(url: &str) -> io::Result<Vec<u8>> {
-    match ureq::get(url).call() {
-        Ok(mut res) => res
-            .body_mut()
-            .with_config()
-            .limit(MAX_BODY.try_into().unwrap())
-            .read_to_vec()
-            .map_err(io::Error::other),
-        Err(ureq::Error::StatusCode(404)) => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{url}: not found"),
-        )),
-        Err(e) => Err(io::Error::other(format!("{url}: {e}"))),
-    }
-}
-
-const MAX_BODY: usize = 256 * 1024 * 1024;
+const MAX_BODY: u64 = 256 * 1024 * 1024;
 
 fn extract_attr(line: &str, _tag: &str, attr: &str) -> Option<String> {
 
@@ -850,18 +848,18 @@ mod tests {
     fn search_by_name_and_desc() {
         let _g = crate::store::TEST_HOME_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir()
-            .join(format!("unipkg-rpmrepo-search-{}", std::process::id()));
+            .join(format!("univ-rpmrepo-search-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        unsafe { std::env::set_var("HOME", &tmp) };
 
         let repo = FedoraRepo {
             name: "fedora".into(),
             base: "http://example.invalid".into(),
             arches: vec!["x86_64".into()],
         };
-        let cache_dir = tmp.join(".local/unipkg/cache");
+        let cache_dir = tmp.join(".local/univ/cache");
         fs::create_dir_all(&cache_dir).unwrap();
         let index = idx(vec![
             pkg("vim-enhanced", "9.1", vec![]),
@@ -883,9 +881,9 @@ mod tests {
         assert!(!found.contains(&"emacs".to_string()));
 
         if let Some(old) = old_home {
-            std::env::set_var("HOME", old);
+            unsafe { std::env::set_var("HOME", old) };
         } else {
-            std::env::remove_var("HOME");
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(&tmp);
     }

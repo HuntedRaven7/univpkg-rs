@@ -1,14 +1,19 @@
 [package]
-name = "unipkg"
+name = "univ"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A universal store based package manager written in Rust"
+default-run = "univ"
 
 [dependencies]
 ar = "0.9"
+crossterm = "0.29"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 lzma-rs = "0.3"
+ratatui = "0.30"
 ruzstd = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tar = "0.4"
 ureq = "3"
 
