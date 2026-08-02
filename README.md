@@ -24,16 +24,7 @@ This is the "unifying" model.
 ## Goals
 
 core
-  - dependency resolution (with conflict detection)
-  - reproducible/deterministic installs (lockfile)
   - transactional installs (atomic, rollback on failure)
-  - signature verification for packages/repos
-
-quality of life
-  - parallel downloads
-  - delta updates (only fetch diffs)
-  - search with fuzzy matching
-  - clean orphan/unused dependency removal
 
 advanced
   - sandboxed builds (containers or namespaces)
