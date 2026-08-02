@@ -1,5 +1,7 @@
 # univ
 
+This is the "unifying" model.
+
 ## How it works
 
 - **Store**: every installed package's files live under a content-addressed
