@@ -74,6 +74,48 @@ fn main() -> ExitCode {
                             term::cyan(&r.base)
                         );
                     }
+                    let mut indexed = 0;
+                    let mut failed = 0;
+                    for r in repo::repos().unwrap_or_default() {
+                        match repo::update(&r) {
+                            Ok(n) => indexed += n,
+                            Err(e) => {
+                                failed += 1;
+                                eprintln!(
+                                    "{}",
+                                    term::warn(&format!(
+                                        "failed to update deb repo '{}': {e}",
+                                        r.name
+                                    ))
+                                );
+                            }
+                        }
+                    }
+                    for r in rpmrepo::repos().unwrap_or_default() {
+                        match rpmrepo::update(&r) {
+                            Ok(n) => indexed += n,
+                            Err(e) => {
+                                failed += 1;
+                                eprintln!(
+                                    "{}",
+                                    term::warn(&format!(
+                                        "failed to update rpm repo '{}': {e}",
+                                        r.name
+                                    ))
+                                );
+                            }
+                        }
+                    }
+                    if failed > 0 {
+                        eprintln!(
+                            "{}",
+                            term::yellow(&format!(
+                                "{failed} repo update(s) failed; run `univ update` / `univ update-rpm` to retry"
+                            ))
+                        );
+                    } else {
+                        println!("{} {indexed} packages", term::bold_green("indexed"));
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

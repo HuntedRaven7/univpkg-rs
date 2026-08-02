@@ -244,8 +244,7 @@ pub fn update(repo: &FedoraRepo) -> io::Result<usize> {
                 bytes
             }
         };
-        let repomd_text =
-            String::from_utf8(repomd_bytes).map_err(io::Error::other)?;
+        let repomd_text = decode_repomd(&repomd_bytes, &repomd_url)?;
 
         let primary_href = find_primary_href(&repomd_text).ok_or_else(|| {
             io::Error::other(format!(
@@ -303,6 +302,38 @@ fn find_primary_href(repomd: &str) -> Option<String> {
             }
     }
     None
+}
+
+fn decompress_by_magic(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    use std::io::Cursor;
+    let mut out = Vec::new();
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        flate2::read::GzDecoder::new(Cursor::new(bytes)).read_to_end(&mut out)?;
+        Ok(out)
+    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        ruzstd::decoding::StreamingDecoder::new(Cursor::new(bytes))
+            .map_err(|e| io::Error::other(format!("zstd: {e}")))?
+            .read_to_end(&mut out)?;
+        Ok(out)
+    } else if bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        lzma_rs::xz_decompress(&mut Cursor::new(bytes), &mut out)
+            .map_err(|e| io::Error::other(format!("xz: {e}")))?;
+        Ok(out)
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
+fn decode_repomd(bytes: &[u8], url: &str) -> io::Result<String> {
+    let decompressed = decompress_by_magic(bytes)?;
+    String::from_utf8(decompressed).map_err(|e| {
+        io::Error::other(format!(
+            "'{url}' did not return a repomd.xml file ({} bytes, {e}). \
+             The repo base URL must point at a repository directory containing \
+             repodata/repomd.xml, not at a package file or web page.",
+            bytes.len()
+        ))
+    })
 }
 
 fn decompress_primary(url: &str, bytes: &[u8]) -> io::Result<String> {
