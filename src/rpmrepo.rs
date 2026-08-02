@@ -394,9 +394,9 @@ fn parse_primary(text: &str) -> Index {
             pkg.location = extract_attr(t, "location", "href");
         } else if t.starts_with("<checksum ") && t.contains("sha256") {
             pkg.sha256 = inner_text(t, "checksum").map(str::to_string);
-        } else if t.starts_with("<requires>") {
+        } else if t.starts_with("<requires>") || t.starts_with("<rpm:requires>") {
             in_req = true;
-        } else if t.starts_with("</requires>") {
+        } else if t.starts_with("</requires>") || t.starts_with("</rpm:requires>") {
             in_req = false;
         } else if in_req && (t.starts_with("<entry ") || t.starts_with("<rpm:entry "))
             && let Some(dep) = parse_dep_entry(t) {

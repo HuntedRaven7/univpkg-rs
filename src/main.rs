@@ -22,6 +22,7 @@ struct SearchResult {
     kind: &'static str,
     repo: String,
     description: String,
+    depends: String,
 }
 
 fn main() -> ExitCode {
@@ -367,6 +368,7 @@ fn main() -> ExitCode {
                             kind: "deb",
                             repo: r.name.clone(),
                             description: p.description,
+                            depends: deb::render_depends(&p.depends),
                         });
                     }
                 }
@@ -381,6 +383,7 @@ fn main() -> ExitCode {
                             kind: "rpm",
                             repo: r.name.clone(),
                             description: p.description,
+                            depends: rpm::render_requires(&p.requires),
                         });
                     }
                 }
@@ -413,6 +416,7 @@ fn main() -> ExitCode {
                             "kind": p.kind,
                             "repo": p.repo,
                             "description": p.description,
+                            "depends": p.depends,
                         })
                     })
                     .collect();

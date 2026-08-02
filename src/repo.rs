@@ -228,6 +228,12 @@ fn component_cache_path(repo: &Repo, arch: &str, component: &str) -> io::Result<
         .join(format!("{}.Packages.{arch}.{component}", repo.name)))
 }
 
+fn legacy_cache_path(repo: &Repo, arch: &str) -> io::Result<PathBuf> {
+    Ok(Store::root()?
+        .join("cache")
+        .join(format!("{}.Packages.{arch}", repo.name)))
+}
+
 fn component_meta_path(repo: &Repo, arch: &str, component: &str) -> io::Result<PathBuf> {
     Ok(Store::root()?
         .join("cache")
@@ -473,6 +479,15 @@ fn read_index(repo: &Repo) -> io::Result<Index> {
     for arch in &repo.arches {
         for component in COMPONENTS {
             let path = component_cache_path(repo, arch, component)?;
+            if let Ok(text) = fs::read_to_string(&path) {
+                index.merge(parse_index(&text));
+                found += 1;
+            }
+        }
+    }
+    if found == 0 {
+        for arch in &repo.arches {
+            let path = legacy_cache_path(repo, arch)?;
             if let Ok(text) = fs::read_to_string(&path) {
                 index.merge(parse_index(&text));
                 found += 1;
