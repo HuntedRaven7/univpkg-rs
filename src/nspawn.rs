@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::store::{Store, StorePath};
 
@@ -254,6 +255,61 @@ pub fn on_filesystem(abs: &Path) -> bool {
 
 fn nspawn_bin() -> String {
     std::env::var("UNIV_NSPAWN").unwrap_or_else(|_| "systemd-nspawn".to_string())
+}
+
+pub fn has_nvidia() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        fs::read_to_string("/proc/driver/nvidia/version")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+pub fn gpu_vendor() -> &'static str {
+    static CACHE: OnceLock<&'static str> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        if has_nvidia() {
+            return "nvidia";
+        }
+        let mut ids = Vec::new();
+        if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+            for e in entries.flatten() {
+                if !e.file_name().to_string_lossy().starts_with("card") {
+                    continue;
+                }
+                if let Ok(v) = fs::read_to_string(e.path().join("device/vendor")) {
+                    ids.push(v.trim().to_string());
+                }
+            }
+        }
+        for id in ids {
+            match id.as_str() {
+                "0x10de" => return "nvidia (driver not loaded)",
+                "0x8086" => return "intel",
+                "0x1002" => return "amd",
+                _ => {}
+            }
+        }
+        "unknown"
+    })
+}
+
+fn nvidia_block() -> &'static str {
+    "if [ -r /proc/driver/nvidia/version ]; then\n\
+     \t  BINDS=\"$BINDS --bind-ro=/proc/driver/nvidia:/proc/driver/nvidia\"\n\
+     \t  for d in /dev/nvidia*; do\n\
+     \t  \t  [ -e \"$d\" ] && BINDS=\"$BINDS --bind=$d:$d\"\n\
+     \t  done\n\
+     \t  [ -d /dev/dri ] && BINDS=\"$BINDS --bind=/dev/dri:/dev/dri\"\n\
+     \t  [ -x /usr/bin/nvidia-smi ] && BINDS=\"$BINDS --bind=/usr/bin/nvidia-smi:/usr/bin/nvidia-smi\"\n\
+     \t  for lib in /usr/lib/x86_64-linux-gnu/libnvidia*.so.* /usr/lib64/libnvidia*.so.* /usr/lib/i386-linux-gnu/libnvidia*.so.*; do\n\
+     \t  \t  if [ -e \"$lib\" ]; then\n\
+     \t  \t  \t  b=${lib##*/}\n\
+     \t  \t  \t  BINDS=\"$BINDS --bind=$lib:/usr/lib/x86_64-linux-gnu/$b --bind=$lib:/usr/lib64/$b\"\n\
+     \t  \t  fi\n\
+     \t  done\n\
+     fi\n"
 }
 
 fn shell_escape(s: &str) -> String {
@@ -552,6 +608,7 @@ pub fn launcher(target: &str, container_root: &Path, store_base: &Path) -> Strin
     let c = shell_escape(&container_root.to_string_lossy());
     let s = shell_escape(&store_base.to_string_lossy());
     let t = shell_escape(target);
+    let nvidia = if has_nvidia() { nvidia_block() } else { "" };
     format!(
         "#!/bin/sh\n\
          {LAUNCHER_MARKER}\n\
@@ -565,6 +622,7 @@ pub fn launcher(target: &str, container_root: &Path, store_base: &Path) -> Strin
          if [ -n \"${{HOME:-}}\" ]; then\n\
          \t  BINDS=\"$BINDS --bind=${{HOME}}:${{HOME}}\"\n\
          fi\n\
+         {nvidia}\
          exec {nspawn} --quiet --directory=\"$CONTAINER\" --bind-ro=\"$STORE:/store\" $BINDS --chdir=/ -- \"{t}\" \"$@\"\n",
         nspawn = nspawn_bin(),
     )
@@ -713,7 +771,21 @@ mod tests {
             assert!(script.contains("-- \"/usr/bin/hello\""));
             assert!(script.contains("--directory=\"$CONTAINER\""));
             assert!(script.contains(&format!("CONTAINER=\"{}\"", root.display())));
+            assert_eq!(script.contains("/proc/driver/nvidia"), has_nvidia());
         });
+    }
+
+    #[test]
+    fn nvidia_block_emits_device_and_driver_binds() {
+        let block = nvidia_block();
+        assert!(block.contains("if [ -r /proc/driver/nvidia/version ]; then"));
+        assert!(block.contains("--bind-ro=/proc/driver/nvidia:/proc/driver/nvidia"));
+        assert!(block.contains("/dev/nvidia*"));
+        assert!(block.contains("/dev/dri"));
+        assert!(block.contains("nvidia-smi"));
+        assert!(block.contains("libnvidia*.so.*"));
+        assert!(block.contains("--bind=$lib:/usr/lib64/$b"));
+        assert!(block.ends_with("fi\n"));
     }
 
     #[test]
