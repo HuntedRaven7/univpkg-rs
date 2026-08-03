@@ -295,21 +295,80 @@ pub fn gpu_vendor() -> &'static str {
     })
 }
 
-fn nvidia_block() -> &'static str {
-    "if [ -r /proc/driver/nvidia/version ]; then\n\
-     \t  BINDS=\"$BINDS --bind-ro=/proc/driver/nvidia:/proc/driver/nvidia\"\n\
-     \t  for d in /dev/nvidia*; do\n\
-     \t  \t  [ -e \"$d\" ] && BINDS=\"$BINDS --bind=$d:$d\"\n\
-     \t  done\n\
-     \t  [ -d /dev/dri ] && BINDS=\"$BINDS --bind=/dev/dri:/dev/dri\"\n\
-     \t  [ -x /usr/bin/nvidia-smi ] && BINDS=\"$BINDS --bind=/usr/bin/nvidia-smi:/usr/bin/nvidia-smi\"\n\
-     \t  for lib in /usr/lib/x86_64-linux-gnu/libnvidia*.so.* /usr/lib64/libnvidia*.so.* /usr/lib/i386-linux-gnu/libnvidia*.so.*; do\n\
-     \t  \t  if [ -e \"$lib\" ]; then\n\
-     \t  \t  \t  b=${lib##*/}\n\
-     \t  \t  \t  BINDS=\"$BINDS --bind=$lib:/usr/lib/x86_64-linux-gnu/$b --bind=$lib:/usr/lib64/$b\"\n\
-     \t  \t  fi\n\
-     \t  done\n\
-     fi\n"
+// NVIDIA userspace libraries the loader/linker needs inside the container.
+//
+// Broader than a plain "libnvidia*.so.*" match: also picks up libcuda (CUDA/compute
+// workloads), libnvcuvid (hardware video decode) and libnvoptix (RTX/OptiX), and
+// matches "*.so*" rather than "*.so.*" so unversioned .so stubs aren't missed
+// (distrobox hit exactly this as a real CUDA-detection bug: 89luca89/distrobox#1764).
+//
+// Each glob only ever reads from one arch's real host directory (x86_64-linux-gnu /
+// lib64 for 64-bit, i386-linux-gnu / lib32 for 32-bit) and is bound into the
+// destinations for that *same* arch class only, mirrored into both the
+// Debian-multiarch and Fedora/RPM-style target paths since a single generated
+// launcher script is shared between both container kinds and doesn't know at
+// generation time which root it'll end up running against. Previously every
+// matched lib (including 32-bit ones) was bound into both the 64-bit
+// x86_64-linux-gnu path and lib64, which would silently hand a 32-bit .so to
+// something expecting a 64-bit one on any host with real i386 nvidia libs present.
+fn nvidia_libs() -> String {
+    let mut out = String::new();
+    out.push_str(
+        "\tfor lib in /usr/lib/x86_64-linux-gnu/lib*nvidia*.so* /usr/lib/x86_64-linux-gnu/libcuda*.so* /usr/lib/x86_64-linux-gnu/libnvcuvid* /usr/lib/x86_64-linux-gnu/libnvoptix* /usr/lib64/lib*nvidia*.so* /usr/lib64/libcuda*.so* /usr/lib64/libnvcuvid* /usr/lib64/libnvoptix*; do\n\
+         \t\tif [ -e \"$lib\" ]; then\n\
+         \t\t\tb=${lib##*/}\n\
+         \t\t\tBINDS=\"$BINDS --bind=$lib:/usr/lib/x86_64-linux-gnu/$b --bind=$lib:/usr/lib64/$b\"\n\
+         \t\tfi\n\
+         \tdone\n",
+    );
+    out.push_str(
+        "\tfor lib in /usr/lib/i386-linux-gnu/lib*nvidia*.so* /usr/lib/i386-linux-gnu/libcuda*.so* /usr/lib32/lib*nvidia*.so* /usr/lib32/libcuda*.so*; do\n\
+         \t\tif [ -e \"$lib\" ]; then\n\
+         \t\t\tb=${lib##*/}\n\
+         \t\t\tBINDS=\"$BINDS --bind=$lib:/usr/lib/i386-linux-gnu/$b --bind=$lib:/usr/lib32/$b\"\n\
+         \t\tfi\n\
+         \tdone\n",
+    );
+    out
+}
+
+// Non-library runtime bits the loaders discover by fixed path rather than the
+// linker: Vulkan ICD/layer JSON, the GLVND EGL vendor JSON, and OpenCL vendor
+// files. Without these, Vulkan/EGL/OpenCL applications can't find the driver
+// even once the libraries above are present, since those loaders don't search
+// LD_LIBRARY_PATH, they read one specific config directory.
+//
+// Known gap, flagged rather than silently assumed correct: some of these JSON
+// files hard-code an absolute host "library_path". distrobox rewrites that
+// path to a bare soname before mirroring the file in so it resolves against
+// the guest's linker cache; this just bind-mounts the file verbatim, so an ICD
+// with an absolute library_path may still fail to resolve inside the
+// container. Rewriting it would mean writing a scratch copy to a temp dir from
+// inside this generated shell script, which is a real chunk of added
+// complexity, left for a follow-up rather than bundled into this pass.
+fn nvidia_confs() -> &'static str {
+    "\tfor conf in /usr/share/glvnd/egl_vendor.d/*nvidia* /usr/share/vulkan/icd.d/*nvidia* /etc/vulkan/icd.d/*nvidia* /usr/share/vulkan/implicit_layer.d/*nvidia* /etc/vulkan/implicit_layer.d/*nvidia* /etc/OpenCL/vendors/*nvidia*; do\n\
+     \t\t[ -e \"$conf\" ] && BINDS=\"$BINDS --bind-ro=$conf:$conf\"\n\
+     \tdone\n"
+}
+
+fn nvidia_block() -> String {
+    format!(
+        "if [ -r /proc/driver/nvidia/version ]; then\n\
+         \tBINDS=\"$BINDS --bind-ro=/proc/driver/nvidia:/proc/driver/nvidia\"\n\
+         \tfor d in /dev/nvidia*; do\n\
+         \t\t[ -e \"$d\" ] && BINDS=\"$BINDS --bind=$d:$d\"\n\
+         \tdone\n\
+         \t[ -d /dev/dri ] && BINDS=\"$BINDS --bind=/dev/dri:/dev/dri\"\n\
+         \tfor bin in /usr/bin/nvidia-smi /usr/bin/nvidia-debugdump /usr/bin/nvidia-persistenced /usr/bin/nvidia-cuda-mps-control /usr/bin/nvidia-cuda-mps-server; do\n\
+         \t\t[ -x \"$bin\" ] && BINDS=\"$BINDS --bind-ro=$bin:$bin\"\n\
+         \tdone\n\
+         {confs}\
+         {libs}\
+         fi\n",
+        confs = nvidia_confs(),
+        libs = nvidia_libs(),
+    )
 }
 
 fn shell_escape(s: &str) -> String {
@@ -604,11 +663,28 @@ fn apt_mirror() -> io::Result<String> {
     ))
 }
 
+// Read-only host-identity files worth mirroring into every container regardless
+// of GPU/X11/audio integration: without these, DNS resolution, hostname-based
+// tooling and anything reading the local timezone can silently misbehave inside
+// the container even though everything else works. Each is optional and only
+// bound if it actually exists on the host (e.g. resolv.conf may be a dangling
+// systemd-resolved stub path on some hosts). Mirrors distrobox's own default
+// HOST_MOUNTS_RO list (89luca89/distrobox distrobox-init).
+fn host_identity_binds() -> &'static str {
+    "\t[ -e /etc/resolv.conf ] && BINDS=\"$BINDS --bind-ro=/etc/resolv.conf:/etc/resolv.conf\"\n\
+     \t[ -e /etc/machine-id ] && BINDS=\"$BINDS --bind-ro=/etc/machine-id:/etc/machine-id\"\n\
+     \t[ -e /etc/localtime ] && BINDS=\"$BINDS --bind-ro=/etc/localtime:/etc/localtime\"\n"
+}
+
 pub fn launcher(target: &str, container_root: &Path, store_base: &Path) -> String {
     let c = shell_escape(&container_root.to_string_lossy());
     let s = shell_escape(&store_base.to_string_lossy());
     let t = shell_escape(target);
-    let nvidia = if has_nvidia() { nvidia_block() } else { "" };
+    let nvidia = if has_nvidia() {
+        nvidia_block()
+    } else {
+        String::new()
+    };
     format!(
         "#!/bin/sh\n\
          {LAUNCHER_MARKER}\n\
@@ -617,14 +693,16 @@ pub fn launcher(target: &str, container_root: &Path, store_base: &Path) -> Strin
          BINDS=\"\"\n\
          [ -d /tmp/.X11-unix ] && BINDS=\"$BINDS --bind=/tmp/.X11-unix:/tmp/.X11-unix\"\n\
          if [ -n \"${{XDG_RUNTIME_DIR:-}}\" ]; then\n\
-         \t  BINDS=\"$BINDS --bind=${{XDG_RUNTIME_DIR}}:${{XDG_RUNTIME_DIR}}\"\n\
+         \tBINDS=\"$BINDS --bind=${{XDG_RUNTIME_DIR}}:${{XDG_RUNTIME_DIR}}\"\n\
          fi\n\
          if [ -n \"${{HOME:-}}\" ]; then\n\
-         \t  BINDS=\"$BINDS --bind=${{HOME}}:${{HOME}}\"\n\
+         \tBINDS=\"$BINDS --bind=${{HOME}}:${{HOME}}\"\n\
          fi\n\
+         {host_identity}\
          {nvidia}\
          exec {nspawn} --quiet --directory=\"$CONTAINER\" --bind-ro=\"$STORE:/store\" $BINDS --chdir=/ -- \"{t}\" \"$@\"\n",
         nspawn = nspawn_bin(),
+        host_identity = host_identity_binds(),
     )
 }
 
@@ -772,20 +850,50 @@ mod tests {
             assert!(script.contains("--directory=\"$CONTAINER\""));
             assert!(script.contains(&format!("CONTAINER=\"{}\"", root.display())));
             assert_eq!(script.contains("/proc/driver/nvidia"), has_nvidia());
+            assert!(script.contains("/etc/resolv.conf:/etc/resolv.conf"));
+            assert!(script.contains("/etc/machine-id:/etc/machine-id"));
+            assert!(script.contains("/etc/localtime:/etc/localtime"));
         });
     }
 
     #[test]
-    fn nvidia_block_emits_device_and_driver_binds() {
+    fn nvidia_block_emits_device_driver_and_config_binds() {
         let block = nvidia_block();
         assert!(block.contains("if [ -r /proc/driver/nvidia/version ]; then"));
         assert!(block.contains("--bind-ro=/proc/driver/nvidia:/proc/driver/nvidia"));
         assert!(block.contains("/dev/nvidia*"));
         assert!(block.contains("/dev/dri"));
         assert!(block.contains("nvidia-smi"));
-        assert!(block.contains("libnvidia*.so.*"));
-        assert!(block.contains("--bind=$lib:/usr/lib64/$b"));
+        assert!(block.contains("nvidia-persistenced"));
         assert!(block.ends_with("fi\n"));
+    }
+
+    #[test]
+    fn nvidia_libs_covers_cuda_video_and_optix_and_keeps_arch_classes_separate() {
+        let libs = nvidia_libs();
+        // broader glob than plain libnvidia*: cuda/video-decode/optix libs
+        assert!(libs.contains("libcuda*.so*"));
+        assert!(libs.contains("libnvcuvid*"));
+        assert!(libs.contains("libnvoptix*"));
+        // 64-bit sources only ever get bound into 64-bit destinations
+        assert!(libs.contains(
+            "--bind=$lib:/usr/lib/x86_64-linux-gnu/$b --bind=$lib:/usr/lib64/$b"
+        ));
+        // 32-bit sources only ever get bound into 32-bit destinations, never mixed
+        // with the 64-bit loop above
+        assert!(libs.contains(
+            "--bind=$lib:/usr/lib/i386-linux-gnu/$b --bind=$lib:/usr/lib32/$b"
+        ));
+        assert!(!libs.contains("i386-linux-gnu/$b --bind=$lib:/usr/lib64/$b"));
+    }
+
+    #[test]
+    fn nvidia_confs_covers_vulkan_glvnd_and_opencl() {
+        let confs = nvidia_confs();
+        assert!(confs.contains("glvnd/egl_vendor.d"));
+        assert!(confs.contains("vulkan/icd.d"));
+        assert!(confs.contains("vulkan/implicit_layer.d"));
+        assert!(confs.contains("OpenCL/vendors"));
     }
 
     #[test]
