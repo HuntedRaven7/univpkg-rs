@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::deb::DebMeta;
 use crate::resolve;
@@ -150,6 +150,7 @@ impl Index {
 pub fn repos() -> io::Result<Vec<FedoraRepo>> {
     let conf = Store::root()?.join("rpmrepos.conf");
     let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     if let Ok(text) = fs::read_to_string(&conf) {
         for line in text.lines() {
             let line = line.trim();
@@ -158,6 +159,9 @@ pub fn repos() -> io::Result<Vec<FedoraRepo>> {
             }
             let mut it = line.split_whitespace();
             let (Some(name), Some(base)) = (it.next(), it.next()) else { continue };
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
             let arches: Vec<String> = it.map(str::to_string).collect();
             out.push(FedoraRepo {
                 name: name.to_string(),
@@ -197,6 +201,9 @@ pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
     if let Some(parent) = conf.parent() {
         fs::create_dir_all(parent)?;
     }
+    if repo_configured(&conf, name) {
+        return Ok(());
+    }
     let arches_part = if arches.is_empty() {
         host_arch().to_string()
     } else {
@@ -209,6 +216,20 @@ pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
         .open(&conf)?
         .write_all(line.as_bytes())?;
     Ok(())
+}
+
+fn repo_configured(conf: &Path, name: &str) -> bool {
+    fs::read_to_string(conf)
+        .map(|text| {
+            text.lines().any(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return false;
+                }
+                line.split_whitespace().next() == Some(name)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn cache_path(repo: &FedoraRepo, arch: &str) -> io::Result<PathBuf> {
@@ -235,7 +256,15 @@ pub fn update(repo: &FedoraRepo) -> io::Result<usize> {
             &validators,
         )?;
         let repomd_bytes = match outcome {
-            crate::term::FetchOutcome::NotModified if cache_file.exists() => continue,
+            crate::term::FetchOutcome::NotModified if cache_file.exists() => {
+                if let Ok(text) = fs::read_to_string(&cache_file) {
+                    let index = parse_index(&text);
+                    let n = index.by_name.values().map(|v| v.len()).sum::<usize>();
+                    println!("{} ({arch}): {n} packages", crate::term::cyan(&repo.name));
+                    total += n;
+                }
+                continue;
+            }
             crate::term::FetchOutcome::NotModified => {
                 crate::term::http_get(&repomd_url, "repomd.xml", Some(MAX_BODY))?
             }
@@ -1180,7 +1209,7 @@ mod tests {
             base: "http://example.invalid".into(),
             arches: vec!["x86_64".into()],
         };
-        let cache_dir = tmp.join(".local/univ/cache");
+        let cache_dir = tmp.join(".local/share/univ/cache");
         fs::create_dir_all(&cache_dir).unwrap();
         let index = idx(vec![
             pkg("vim-enhanced", "9.1", vec![]),

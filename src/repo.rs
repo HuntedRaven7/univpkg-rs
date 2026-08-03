@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::deb::{self, DebMeta, Dep};
 use crate::resolve;
@@ -12,7 +12,7 @@ const COMPONENTS: &[&str] = &["main", "contrib", "non-free", "non-free-firmware"
 
 const DEFAULT_REPO_NAME: &str = "debian";
 const DEFAULT_REPO_BASE: &str = "http://deb.debian.org/debian";
-const DIST: &str = "stable";
+pub(crate) const DIST: &str = "stable";
 
 const DEFAULT_ARCHES: &[&str] = &["amd64", "i386"];
 
@@ -152,6 +152,7 @@ impl Index {
 pub fn repos() -> io::Result<Vec<Repo>> {
     let conf = Store::root()?.join("debrepos.conf");
     let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     if let Ok(text) = fs::read_to_string(&conf) {
         for line in text.lines() {
             let line = line.trim();
@@ -162,6 +163,9 @@ pub fn repos() -> io::Result<Vec<Repo>> {
             let (Some(name), Some(base)) = (it.next(), it.next()) else {
                 continue;
             };
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
             let arches: Vec<String> = it.map(str::to_string).collect();
             out.push(Repo {
                 name: name.to_string(),
@@ -204,6 +208,9 @@ pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
     if let Some(parent) = conf.parent() {
         fs::create_dir_all(parent)?;
     }
+    if repo_configured(&conf, name) {
+        return Ok(());
+    }
     let arches_part = if arches.is_empty() {
         default_arches().join(" ")
     } else {
@@ -216,6 +223,20 @@ pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
         .open(&conf)?
         .write_all(line.as_bytes())?;
     Ok(())
+}
+
+fn repo_configured(conf: &Path, name: &str) -> bool {
+    fs::read_to_string(conf)
+        .map(|text| {
+            text.lines().any(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return false;
+                }
+                line.split_whitespace().next() == Some(name)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn default_arches() -> Vec<String> {
@@ -541,6 +562,40 @@ pub fn repo_for(name: &str) -> Option<Repo> {
             .map(|i| i.by_name.contains_key(name))
             .unwrap_or(false)
     })
+}
+
+pub fn fetch(name: &str) -> io::Result<Vec<u8>> {
+    let repo = repo_for(name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no configured deb repo contains '{name}' (run `univ update`)"),
+        )
+    })?;
+    let index = read_index(&repo)
+        .map_err(|_| io::Error::other(format!("no index for repo '{}'; run `univ update`", repo.name)))?;
+    let pkg = index
+        .by_name
+        .get(name)
+        .and_then(|pkgs| {
+            pkgs.iter()
+                .find(|p| p.architecture == "all")
+                .or_else(|| pkgs.first())
+        })
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("'{name}' not in repo '{}'", repo.name))
+        })?;
+    let url = format!("{}/{}", repo.base.trim_end_matches('/'), pkg.filename);
+    let bytes = crate::term::http_get(&url, &pkg.filename, None)?;
+    if let Some(expected) = &pkg.sha256 {
+        let got = sha256_hex(&bytes);
+        if !got.eq_ignore_ascii_case(expected) {
+            return Err(io::Error::other(format!(
+                "checksum mismatch for {}: expected {expected}, got {got}",
+                pkg.filename
+            )));
+        }
+    }
+    Ok(bytes)
 }
 
 pub fn install(store: &Store, repo: &Repo, name: &str) -> io::Result<Vec<(StorePath, DebMeta)>> {
@@ -1179,7 +1234,7 @@ mod tests {
             base: "http://example.invalid/debian".into(),
             arches: vec!["amd64".into()],
         };
-        let cache_dir = tmp.join(".local/univ/cache");
+        let cache_dir = tmp.join(".local/share/univ/cache");
         fs::create_dir_all(&cache_dir).unwrap();
         fs::write(
             cache_dir.join("debian.Packages.amd64.main"),
@@ -1214,6 +1269,43 @@ Description: Steam dependencies
         assert_eq!(by_desc, vec!["steam-installer"]);
 
         assert!(search(&repo, "zzz-nothing").is_empty());
+
+        if let Some(old) = old_home {
+            unsafe { std::env::set_var("HOME", old) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn add_repo_is_idempotent_and_repos_dedup() {
+        let _g = crate::store::TEST_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "univ-addrepo-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &tmp) };
+
+        add_repo("debian", "http://example.invalid/debian", &["amd64".into()]).unwrap();
+        add_repo("debian", "http://example.invalid/debian", &["amd64".into()]).unwrap();
+        add_repo("debian", "http://example.invalid/debian", &["amd64".into()]).unwrap();
+        add_repo("fedora", "http://example.invalid/fedora", &["amd64".into()]).unwrap();
+
+        let repos = repos().unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos.iter().filter(|r| r.name == "debian").count(), 1);
+
+        let conf = tmp.join(".local/share/univ/debrepos.conf");
+        let text = fs::read_to_string(&conf).unwrap();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+            .collect();
+        assert_eq!(lines.len(), 2, "conf must not accumulate duplicates");
 
         if let Some(old) = old_home {
             unsafe { std::env::set_var("HOME", old) };

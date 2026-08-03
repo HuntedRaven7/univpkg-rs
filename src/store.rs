@@ -68,7 +68,7 @@ impl Store {
     }
 
     pub fn root() -> io::Result<PathBuf> {
-        Ok(Self::home_dir()?.join(".local").join(STORE_DIR))
+        Ok(Self::home_dir()?.join(".local").join("share").join(STORE_DIR))
     }
 
     fn base_dir() -> io::Result<PathBuf> {

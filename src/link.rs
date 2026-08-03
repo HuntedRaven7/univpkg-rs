@@ -1,13 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::deb::DebMeta;
-use crate::resolve;
 use crate::store::{Store, StorePath};
 
 const BIN_DIRS: &[&str] = &[
@@ -31,6 +30,7 @@ pub struct Linked {
 
 pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result<Linked> {
     let home = Store::home_dir()?;
+    let kind = crate::nspawn::package_kind(sp);
     let store_path = store.base().join(sp.to_string());
     let bin_dir = home.join(".local").join("bin");
     let apps_dir = home.join(".local").join("share").join("applications");
@@ -42,29 +42,26 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
 
     let mut linked = Linked::default();
     let mut manifest: Vec<(char, PathBuf, PathBuf)> = Vec::new();
-    let installed = resolve::installed_packages(store);
     let mut wrapped: HashMap<String, PathBuf> = HashMap::new();
+    let apps = app_binaries(&store_path);
 
     for src in find_binaries(&store_path)? {
         let name = src
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        if name != meta.package && !apps.contains(&name) {
+            continue;
+        }
         let dest = bin_dir.join(&name);
-        let dirs = resolve::store_lib_dirs(&resolve::resolve_binary(&src, &installed));
-        let result = if dirs.is_empty() {
-            install_bin_link(&src, &dest, store.base())
-        } else {
-            match write_wrapper(&dest, &src, &dirs) {
-                Ok(()) => {
-                    wrapped.insert(name.clone(), dest.clone());
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
+        let rel = match src.strip_prefix(&store_path) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => continue,
         };
-        match result {
+        let target = crate::nspawn::container_path_for(&rel);
+        match install_launcher(&dest, &target, kind, store) {
             Ok(()) => {
+                wrapped.insert(name.clone(), dest.clone());
                 linked.bin_links.push(dest.clone());
                 manifest.push(('B', dest, src));
             }
@@ -125,6 +122,14 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
     }
 
     write_manifest(sp, &manifest)?;
+    crate::nspawn::rebuild_tree(store)?;
+    if !crate::nspawn::bootstrapped(kind) {
+        eprintln!(
+            "univ: warning: the {} container has no base OS yet; run `univ bootstrap` \
+             (needs root) so installed programs can run inside it",
+            kind.name()
+        );
+    }
     Ok(linked)
 }
 
@@ -224,6 +229,7 @@ fn remove_orphans(store: &Store) -> Vec<String> {
         removed.push(name);
     }
     let _ = lock.save();
+    let _ = crate::nspawn::rebuild_tree(store);
     removed
 }
 
@@ -329,19 +335,31 @@ fn write_desktop(dest: &Path, text: &str) -> io::Result<()> {
     fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
 }
 
-fn write_wrapper(dest: &Path, target: &Path, dirs: &[PathBuf]) -> io::Result<()> {
-    let ld = dirs
-        .iter()
-        .map(|d| d.display().to_string())
-        .collect::<Vec<_>>()
-        .join(":");
-    let script = format!(
-        "#!/bin/sh\nLD_LIBRARY_PATH=\"{ld}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\" exec \"{target}\" \"$@\"\n",
-        target = target.display()
-    );
-    fs::write(dest, script.as_bytes())?;
-    fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
-    Ok(())
+fn app_binaries(store_path: &Path) -> HashSet<String> {
+    let mut apps = HashSet::new();
+    if let Ok(entries) = fs::read_dir(store_path.join("usr/share/applications")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            for line in text.lines() {
+                let Some((key, value)) = line.split_once('=') else { continue };
+                if !matches!(key.trim_end(), "Exec" | "TryExec") {
+                    continue;
+                }
+                if let Some(name) = value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|c| Path::new(c).file_name())
+                {
+                    apps.insert(name.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    apps
 }
 
 pub(crate) fn find_binaries(store_path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -363,29 +381,32 @@ pub(crate) fn find_binaries(store_path: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn install_bin_link(src: &Path, dest: &Path, store_base: &Path) -> io::Result<()> {
+fn install_launcher(
+    dest: &Path,
+    target: &str,
+    kind: crate::nspawn::ContainerKind,
+    store: &Store,
+) -> io::Result<()> {
+    let container_root = crate::nspawn::root(kind)?;
+    let text = crate::nspawn::launcher(target, &container_root, store.base());
     match fs::symlink_metadata(dest) {
-        Ok(md) => {
-            if md.file_type().is_symlink() {
-                let target = fs::read_link(dest)?;
-                if !target.starts_with(store_base) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("{} points outside the store", dest.display()),
-                    ));
-                }
-                fs::remove_file(dest)?;
-            } else {
+        Ok(md) if md.file_type().is_symlink() => {
+            let _ = fs::remove_file(dest);
+        }
+        Ok(_) => {
+            let existing = fs::read_to_string(dest).unwrap_or_default();
+            if !existing.contains(crate::nspawn::LAUNCHER_MARKER) {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    format!("{} already exists", dest.display()),
+                    format!("{} already exists and is not managed by univ", dest.display()),
                 ));
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    symlink(src, dest)
+    fs::write(dest, text.as_bytes())?;
+    fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
 }
 
 struct IconCopy {
@@ -409,9 +430,7 @@ fn rewrite_desktop(
             };
             let key = key.trim_end();
             match key {
-                "Exec" | "TryExec" => {
-                    format!("{key}={}", rewrite_exec(value, store_path, wrapped))
-                }
+                "Exec" | "TryExec" => format!("{key}={}", rewrite_exec(value, wrapped)),
                 "Icon" => {
                     let (value, mut cs) =
                         rewrite_icon(value, store_path, icons_dir, pixmaps_dir);
@@ -429,47 +448,17 @@ fn rewrite_desktop(
     (rewritten, copies)
 }
 
-fn rewrite_exec(
-    value: &str,
-    store_path: &Path,
-    wrapped: &HashMap<String, PathBuf>,
-) -> String {
+fn rewrite_exec(value: &str, wrapped: &HashMap<String, PathBuf>) -> String {
     let mut split = value.splitn(2, |c: char| c.is_whitespace());
     let cmd = split.next().unwrap_or("");
     let rest = split.next().unwrap_or("").trim_start();
-    let new_cmd = if cmd.starts_with('/') {
-        match Path::new(cmd).strip_prefix("/usr/bin/") {
-            Ok(rel) => {
-                let name = rel
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                match wrapped.get(&name) {
-                    Some(w) => w.to_string_lossy().into_owned(),
-                    None => store_path
-                        .join("usr/bin")
-                        .join(name)
-                        .to_string_lossy()
-                        .into_owned(),
-                }
-            }
-            Err(_) => store_path
-                .join(cmd.trim_start_matches('/'))
-                .to_string_lossy()
-                .into_owned(),
-        }
-    } else {
-        match wrapped.get(cmd) {
-            Some(w) => w.to_string_lossy().into_owned(),
-            None => {
-                let in_store = store_path.join("usr/bin").join(cmd);
-                if in_store.exists() {
-                    in_store.to_string_lossy().into_owned()
-                } else {
-                    cmd.to_string()
-                }
-            }
-        }
+    let base = Path::new(cmd)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cmd.to_string());
+    let new_cmd = match wrapped.get(&base) {
+        Some(w) => w.to_string_lossy().into_owned(),
+        None => cmd.to_string(),
     };
     if rest.is_empty() {
         new_cmd
@@ -650,9 +639,9 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
-        let store = crate::store::test_store(&tmp.join("store"));
-        fs::create_dir_all(store.base()).unwrap();
         let home = test_home(&tmp, "home");
+        let store = crate::store::test_store(&home.join(".local/share/univ/store"));
+        fs::create_dir_all(store.base()).unwrap();
         let old_home = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &home) };
         let result = f(&store, &home);
@@ -673,11 +662,32 @@ mod tests {
             let linked = link_package(store, &sp, &meta()).unwrap();
 
             assert_eq!(linked.bin_links, vec![home.join(".local/bin/foo")]);
-            let link = home.join(".local/bin/foo");
-            assert!(link.is_symlink());
+            let launcher = home.join(".local/bin/foo");
+            assert!(launcher.is_file(), "launcher must be a script");
+            let script = fs::read_to_string(&launcher).unwrap();
+            assert!(
+                script.starts_with("#!/bin/sh")
+                    && script.contains(crate::nspawn::LAUNCHER_MARKER),
+                "{script}"
+            );
+            assert!(script.contains("systemd-nspawn --quiet"));
+            assert!(script.contains("-- \"/usr/bin/foo\""), "{script}");
+
+            let container = crate::nspawn::root(crate::nspawn::ContainerKind::Deb).unwrap();
+            let tree_link = container.join("usr/bin/foo");
+            assert!(
+                tree_link.is_symlink(),
+                "container tree must merge the package binary"
+            );
             assert_eq!(
-                fs::read_link(&link).unwrap(),
-                store.base().join(sp.to_string()).join("usr/bin/foo")
+                fs::read_link(&tree_link).unwrap(),
+                Path::new("../../../store")
+                    .join(sp.to_string())
+                    .join("usr/bin/foo")
+            );
+            assert!(
+                tree_link.exists(),
+                "relative link must resolve to the store on the host"
             );
 
             let desktop = home.join(".local/share/applications/univ-hello-foo.desktop");
@@ -690,9 +700,8 @@ mod tests {
                 "desktop file must be executable for GNOME"
             );
             assert!(text.contains("Name=Foo Bar (univ)"), "{text}");
-            let store_bin = store.base().join(sp.to_string()).join("usr/bin/foo");
             assert!(
-                text.contains(&format!("Exec={} --new-window", store_bin.display())),
+                text.contains(&format!("Exec={} --new-window", launcher.display())),
                 "{text}"
             );
             let icon_dest = home.join(".local/share/icons/hicolor/scalable/apps/foo.svg");
@@ -707,10 +716,26 @@ mod tests {
 
             let removed = unlink("hello").unwrap();
             assert!(removed >= 3, "removed {removed}");
-            assert!(!link.exists() && fs::symlink_metadata(&link).is_err());
+            assert!(!launcher.exists() && fs::symlink_metadata(&launcher).is_err());
             assert!(!desktop.exists());
             assert!(!icon_dest.exists());
             assert!(!Store::state_dir().unwrap().join(sp.to_string()).exists());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn helper_binaries_get_no_launcher() {
+        with_env("helper-bin", |store, home| {
+            let sp = sp();
+            fake_store_path(store, &sp);
+            let root = store.base().join(sp.to_string());
+            let helper = root.join("usr/bin/foo-helper");
+            fs::write(&helper, "#!/bin/sh\necho helper\n").unwrap();
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+            let linked = link_package(store, &sp, &meta()).unwrap();
+            assert_eq!(linked.bin_links, vec![home.join(".local/bin/foo")]);
+            assert!(!home.join(".local/bin/foo-helper").exists());
             Ok(())
         });
     }
@@ -733,6 +758,10 @@ mod tests {
             assert!(orphans.is_empty());
             assert!(!store_root.exists());
             assert!(!home.join(".local/bin/foo").exists());
+            assert!(!crate::nspawn::root(crate::nspawn::ContainerKind::Deb)
+                .unwrap()
+                .join("usr/bin/foo")
+                .exists());
             assert!(!Store::state_dir().unwrap().join(sp.to_string()).exists());
             Ok(())
         });

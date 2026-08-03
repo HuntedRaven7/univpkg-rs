@@ -79,6 +79,25 @@ fn read_control(name: &str, bytes: &[u8]) -> io::Result<DebMeta> {
     Err(invalid("control.tar has no `control` file"))
 }
 
+pub fn extract_to(deb: &[u8], dir: &Path) -> io::Result<DebMeta> {
+    let (control_name, control) = member(deb, "control.tar")?
+        .ok_or_else(|| invalid("no control.tar member in archive"))?;
+    let (data_name, data) = member(deb, "data.tar")?
+        .ok_or_else(|| invalid("no data.tar member in archive"))?;
+    let meta = read_control(&control_name, &control)?;
+    let tmp = std::env::temp_dir().join(format!("univ-extract-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp)?;
+    let result = (|| {
+        let mut reader = open_payload(&data_name, &data, &tmp)?;
+        let mut archive = tar::Archive::new(&mut reader);
+        archive.unpack(dir)
+    })();
+    let _ = fs::remove_dir_all(&tmp);
+    result?;
+    Ok(meta)
+}
+
 fn unpack_data(
     name: &str,
     bytes: &[u8],
@@ -280,6 +299,7 @@ pub fn write_meta(meta: &DebMeta, sp: &StorePath) -> io::Result<()> {
     if !meta.description.is_empty() {
         text.push_str(&format!("Description: {}\n", meta.description));
     }
+    text.push_str("Kind: deb\n");
     fs::write(dir.join("meta"), text)
 }
 
@@ -379,6 +399,25 @@ mod tests {
             ("./usr/bin/hello", b"#!/bin/sh\necho hi\n", 0o755),
             ("./usr/share/doc/hello/readme", b"read me\n", 0o644),
         ])
+    }
+
+    #[test]
+    fn extract_to_unpacks_data_into_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "univ-deb-extract-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let deb = make_deb("data.tar.gz", &hello_data());
+        let meta = extract_to(&deb, &dir).unwrap();
+        assert_eq!(meta.package, "hello");
+        assert_eq!(
+            fs::read_to_string(dir.join("usr/bin/hello")).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        assert!(dir.join("usr/share/doc/hello/readme").is_file());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
