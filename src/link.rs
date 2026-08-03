@@ -45,6 +45,7 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
     let mut wrapped: HashMap<String, PathBuf> = HashMap::new();
     let apps = app_binaries(&store_path);
 
+    let mut linked_names: HashSet<String> = HashSet::new();
     for src in find_binaries(&store_path)? {
         let name = src
             .file_name()
@@ -53,6 +54,7 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
         if name != meta.package && !apps.contains(&name) {
             continue;
         }
+        
         let dest = bin_dir.join(&name);
         let rel = match src.strip_prefix(&store_path) {
             Ok(r) => r.to_path_buf(),
@@ -63,9 +65,43 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
             Ok(()) => {
                 wrapped.insert(name.clone(), dest.clone());
                 linked.bin_links.push(dest.clone());
-                manifest.push(('B', dest, src));
-            }
+                manifest.push(('B', dest, src.clone()));
+                linked_names.insert(name.clone());
+            },
             Err(e) => eprintln!("univ: warning: not linking {name}: {e}"),
+        }
+    }
+
+
+    let fallback_names: Vec<String> = apps.difference(&linked_names).cloned().collect();
+    for name in fallback_names {
+        if let Some(path) = find_executable_by_name(&store_path, &name) {
+            let dest = bin_dir.join(&name);
+            let rel = path.strip_prefix(&store_path).unwrap_or(&path).to_path_buf();
+            let target = crate::nspawn::container_path_for(&rel);
+            if let Err(e) = install_launcher(&dest, &target, kind, store) {
+                eprintln!("univ: warning: not linking fallback {}: {}", name, e);
+                continue;
+            }
+            wrapped.insert(name.clone(), dest.clone());
+            linked.bin_links.push(dest.clone());
+            manifest.push(('B', dest.clone(), path.clone()));
+            linked_names.insert(name.clone());
+        }
+    }
+
+    if !linked_names.contains(&meta.package) {
+        if let Some(path) = find_executable_by_name(&store_path, &meta.package) {
+            let dest = bin_dir.join(&meta.package);
+            let rel = path.strip_prefix(&store_path).unwrap_or(&path).to_path_buf();
+            let target = crate::nspawn::container_path_for(&rel);
+            if let Err(e) = install_launcher(&dest, &target, kind, store) {
+                eprintln!("univ: warning: not linking {}: {}", meta.package, e);
+            } else {
+                wrapped.insert(meta.package.clone(), dest.clone());
+                linked.bin_links.push(dest.clone());
+                manifest.push(('B', dest, path.clone()));
+            }
         }
     }
 
@@ -362,7 +398,7 @@ fn app_binaries(store_path: &Path) -> HashSet<String> {
     apps
 }
 
-pub(crate) fn find_binaries(store_path: &Path) -> io::Result<Vec<PathBuf>> {
+pub fn find_binaries(store_path: &Path) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for rel in BIN_DIRS {
         let dir = store_path.join(rel);
@@ -373,8 +409,33 @@ pub(crate) fn find_binaries(store_path: &Path) -> io::Result<Vec<PathBuf>> {
         for entry in entries.flatten() {
             let path = entry.path();
             let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+            if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
                 out.push(path);
+            }
+        }
+    }
+    let fallback_dirs = [
+        "usr/lib",
+        "opt",
+        "usr/share",
+    ];
+    for rel in &fallback_dirs {
+        let base = store_path.join(rel);
+        if let Ok(entries) = fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    out.push(path.clone());
+                } else if path.is_dir() {
+                    if let Ok(inner) = fs::read_dir(&path) {
+                        for inner_entry in inner.flatten() {
+                            let inner_path = inner_entry.path();
+                            if inner_path.is_file() {
+                                out.push(inner_path.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -540,29 +601,61 @@ fn find_icon_files(
 fn collect_icon_dir(
     dir: &Path,
     name: &str,
-    theme_root: &Path,
+    root: &Path,
     icons_dir: &Path,
     out: &mut Vec<IconCopy>,
 ) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_icon_dir(&path, name, theme_root, icons_dir, out);
-        } else {
-            let stem = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if stem == name
-                && let Ok(rel) = path.strip_prefix(theme_root) {
-                    out.push(IconCopy {
-                        dest: icons_dir.join(rel),
-                        source: path,
-                    });
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_icon_dir(&path, name, root, icons_dir, out);
+            } else if path.is_file() {
+                if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy()) {
+                    if stem == name {
+                        let rel = path.strip_prefix(root).unwrap_or(&path);
+                        out.push(IconCopy {
+                            dest: icons_dir.join(rel),
+                            source: path,
+                        });
+                    }
                 }
+            }
         }
     }
+}
+
+fn find_executable_by_name(store_path: &Path, name: &str) -> Option<PathBuf> {
+    let search_dirs = ["usr/lib", "usr/share", "opt"];
+    for dir in &search_dirs {
+        let base = store_path.join(dir);
+        if let Ok(entries) = fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                        if file_name == name {
+                            return Some(path);
+                        }
+                    }
+                } else if path.is_dir() {
+                    if let Ok(inner) = fs::read_dir(&path) {
+                        for inner_entry in inner.flatten() {
+                            let inner_path = inner_entry.path();
+                            if inner_path.is_file() {
+                                if let Some(inner_name) = inner_path.file_name().and_then(|n| n.to_str()) {
+                                    if inner_name == name {
+                                        return Some(inner_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn copy_icon_file(source: &Path, dest: &Path) -> io::Result<()> {
