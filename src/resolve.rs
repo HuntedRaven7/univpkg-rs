@@ -55,11 +55,24 @@ pub fn installed_packages(store: &Store) -> Vec<Installed> {
 }
 
 pub fn system_library(soname: &str, class: u8, machine: u16) -> Option<PathBuf> {
-    SYSTEM_LIB_DIRS
-        .iter()
-        .map(Path::new)
-        .map(|d| d.join(soname))
-        .find(|p| p.exists() && arch_matches(p, class, machine))
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if crate::nspawn::initialized() {
+        for kind in [crate::nspawn::ContainerKind::Deb, crate::nspawn::ContainerKind::Rpm] {
+            if let Ok(r) = crate::nspawn::root(kind) {
+                roots.push(r);
+            }
+        }
+    }
+    roots.push(PathBuf::from("/"));
+    for root in &roots {
+        for d in SYSTEM_LIB_DIRS {
+            let p = root.join(d.trim_start_matches('/')).join(soname);
+            if p.exists() && arch_matches(&p, class, machine) {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 fn store_library(pkg: &Installed, soname: &str, class: u8, machine: u16) -> Option<PathBuf> {
@@ -139,17 +152,6 @@ pub fn resolve_binary(binary: &Path, installed: &[Installed]) -> Vec<ResolvedLib
 
     resolved.sort_by(|a, b| a.name.cmp(&b.name));
     resolved
-}
-
-pub fn store_lib_dirs(deps: &[ResolvedLib]) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    for d in deps {
-        if let LibSource::Store { dir, .. } = &d.source
-            && !out.contains(dir) {
-                out.push(dir.clone());
-            }
-    }
-    out
 }
 
 pub fn interpreter(binary: &Path) -> Option<String> {
@@ -245,7 +247,6 @@ mod tests {
         };
         assert_eq!(package, "libfoo");
         assert_eq!(dir, &lib_root.join("usr/lib/x86_64-linux-gnu"));
-        assert_eq!(store_lib_dirs(&deps), vec![dir.clone()]);
 
         fs::remove_dir_all(&tmp).unwrap();
     }
@@ -328,7 +329,6 @@ mod tests {
 
         let deps = resolve_binary(&app_root.join("usr/bin/foo"), &[app]);
         assert!(matches!(deps[0].source, LibSource::Missing));
-        assert!(store_lib_dirs(&deps).is_empty());
 
         fs::remove_dir_all(&tmp).unwrap();
     }

@@ -2,6 +2,8 @@ mod deb;
 mod elf;
 mod link;
 mod lock;
+mod config;
+mod nspawn;
 mod profile;
 mod repo;
 mod resolve;
@@ -45,19 +47,38 @@ fn main() -> ExitCode {
     match command {
         "--store" | "store" => run_store(),
         "init" => {
-            let result: io::Result<store::Store> = (|| {
-                let s = store::Store::init()?;
+            let result: io::Result<()> = (|| {
+                let _s = store::Store::init()?;
+                nspawn::init(nspawn::ContainerKind::Deb)?;
+                nspawn::init(nspawn::ContainerKind::Rpm)?;
                 repo::ensure_default_repo()?;
                 rpmrepo::ensure_default_repo()?;
-                Ok(s)
+                ensure_bashrc()?;
+                Ok(())
             })();
             match result {
-                Ok(s) => {
+                Ok(()) => {
                     println!(
                         "{} {}",
                         term::bold_green("initialized"),
-                        term::cyan(&format!("store at {}", s.base().display()))
+                        term::cyan(
+                            &store::Store::root()
+                                .map(|r| r.display().to_string())
+                                .unwrap_or_default()
+                        )
                     );
+                    println!("{}", term::bold("containers:"));
+                    for kind in [nspawn::ContainerKind::Deb, nspawn::ContainerKind::Rpm] {
+                        println!(
+                            "  {} -> {}",
+                            term::bold_cyan(kind.name()),
+                            term::cyan(
+                                &nspawn::root(kind)
+                                    .map(|r| r.display().to_string())
+                                    .unwrap_or_default()
+                            )
+                        );
+                    }
                     println!("{}", term::bold("configured repos:"));
                     for r in repo::repos().unwrap_or_default() {
                         println!(
@@ -117,6 +138,22 @@ fn main() -> ExitCode {
                     } else {
                         println!("{} {indexed} packages", term::bold_green("indexed"));
                     }
+                    match nspawn::bootstrap() {
+                        Ok(()) => {}
+                        Err(e) => eprintln!("{}", term::warn(&format!("bootstrap incomplete: {e}"))),
+                    }
+                    for kind in [nspawn::ContainerKind::Deb, nspawn::ContainerKind::Rpm] {
+                        let label = if nspawn::bootstrapped(kind) {
+                            term::bold_green("bootstrapped").to_string()
+                        } else {
+                            term::yellow("no base OS yet (run `univ bootstrap`)").to_string()
+                        };
+                        println!(
+                            "{} {}: {label}",
+                            term::bold("container"),
+                            term::bold_cyan(kind.name())
+                        );
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -125,6 +162,48 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "apply" => {
+            let path = match args.get(1) {
+                Some(p) => p.clone(),
+                None => match store::Store::root() {
+                    Ok(r) => r.join("config.kdl").to_string_lossy().into_owned(),
+                    Err(_) => "config.kdl".to_string(),
+                },
+            };
+            match config::process_file(&path) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{}", term::error(&e.to_string()));
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "bootstrap" => match nspawn::bootstrap() {
+            Ok(()) => {
+                for kind in [nspawn::ContainerKind::Deb, nspawn::ContainerKind::Rpm] {
+                    let label = if nspawn::bootstrapped(kind) {
+                        term::bold_green("bootstrapped").to_string()
+                    } else {
+                        term::yellow("no base OS yet").to_string()
+                    };
+                    println!(
+                        "{} {} -> {} ({label})",
+                        term::bold("container"),
+                        term::bold_cyan(kind.name()),
+                        term::cyan(
+                            &nspawn::root(kind)
+                                .map(|r| r.display().to_string())
+                                .unwrap_or_default()
+                        )
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", term::error(&e.to_string()));
+                ExitCode::FAILURE
+            }
+        },
         "status" => match store::Store::open() {
             Ok(s) => {
                 println!(
@@ -481,7 +560,7 @@ fn main() -> ExitCode {
             for bin in bins {
                 println!("{}:", bin.display());
                 if let Some(interp) = resolve::interpreter(&bin) {
-                    let status = if std::path::Path::new(&interp).exists() {
+                    let status = if nspawn::on_filesystem(std::path::Path::new(&interp)) {
                         "ok"
                     } else {
                         "MISSING"
@@ -790,10 +869,15 @@ fn installed_line(meta: &deb::DebMeta) -> String {
 fn print_help() {
     println!("univ - a content-addressed package manager");
     println!();
+    println!("packages are installed into a systemd-nspawn container (~/.local/univ/container)");
+    println!("and run via nspawn launchers in ~/.local/bin, keeping the host filesystem clean");
+    println!();
     println!("usage: univ <command> [args]");
     println!();
     println!("commands:");
     println!("  init                    create the store at ~/.local/univ (with default deb & rpm repos)");
+    println!("  bootstrap               install a base OS into the container (dnf --installroot / debootstrap; needs root)");
+    println!("  apply [file.kdl]        apply a declarative KDL config (default ~/.local/univ/config.kdl)");
     println!("  store (or --store)      open the interactive store TUI (univ-store)");
     println!("  status                  list installed store paths");
     println!("  list                    list installed packages (add --json for machine-readable)");
@@ -1230,4 +1314,35 @@ fn parse_repo_args(rest: &[&str]) -> (String, String, Vec<String>) {
     let base = rest[1].to_string();
     let arches: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
     (name, base, arches)
+}
+
+const BASHRC_START: &str = "# >>> univ >>>";
+const BASHRC_END: &str = "# <<< univ <<<";
+
+fn ensure_bashrc() -> io::Result<()> {
+    let home = store::Store::home_dir().unwrap_or_default();
+    let rc = home.join(".bashrc");
+    let existing = std::fs::read_to_string(&rc).unwrap_or_default();
+    if existing.contains(BASHRC_START) && existing.contains(BASHRC_END) {
+        return Ok(());
+    }
+    let bin_dir = home.join(".local/bin");
+    let mut text = existing;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "{BASHRC_START}\n\
+         # managed by univ init (see `univ --help`)\n\
+         export PATH=\"{}:${{PATH:+:$PATH}}\"\n\
+         {BASHRC_END}\n",
+        bin_dir.display()
+    ));
+    std::fs::write(&rc, text)?;
+    println!(
+        "{} {}",
+        term::bold_green("wrote"),
+        term::cyan(&rc.display().to_string())
+    );
+    Ok(())
 }

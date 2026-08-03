@@ -174,7 +174,7 @@ mod tests {
         let _g = crate::store::TEST_HOME_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("univ-profile-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(tmp.join(".local/univ")).unwrap();
+        fs::create_dir_all(tmp.join(".local/share/univ")).unwrap();
         unsafe { std::env::set_var("HOME", &tmp) };
 
         save("base", &["hello".into(), "vim".into()]).unwrap();

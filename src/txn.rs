@@ -126,6 +126,13 @@ impl Txn {
         }
         self.done = true;
         let _ = fs::remove_dir_all(&self.trash);
+        if self
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::AddStorePath(_) | Op::RemoveStorePath { .. }))
+        {
+            let _ = crate::nspawn::rebuild_tree(&self.store);
+        }
         Ok(())
     }
 
@@ -261,10 +268,10 @@ mod tests {
         let g = crate::store::TEST_HOME_LOCK.lock().unwrap();
         let tmp = tmp_home(tag);
         let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(tmp.join(".local/univ/store")).unwrap();
-        fs::create_dir_all(tmp.join(".local/univ/state")).unwrap();
+        fs::create_dir_all(tmp.join(".local/share/univ/store")).unwrap();
+        fs::create_dir_all(tmp.join(".local/share/univ/state")).unwrap();
         unsafe { std::env::set_var("HOME", &tmp) };
-        let store = crate::store::test_store(&tmp.join(".local/univ/store"));
+        let store = crate::store::test_store(&tmp.join(".local/share/univ/store"));
         (g, store)
     }
 
