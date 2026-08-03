@@ -154,6 +154,25 @@ fn main() -> ExitCode {
                             term::bold_cyan(kind.name())
                         );
                     }
+                    match nspawn::gpu_vendor() {
+                        "nvidia" => println!(
+                            "{} NVIDIA driver detected: launchers bind GPU devices and driver libs",
+                            term::bold_green("gpu:")
+                        ),
+                        "nvidia (driver not loaded)" => println!(
+                            "{} NVIDIA GPU detected but driver not loaded; launchers run without GPU passthrough",
+                            term::yellow("gpu:")
+                        ),
+                        "intel" | "amd" => println!(
+                            "{} {vendor} GPU detected",
+                            term::bold_cyan("gpu:"),
+                            vendor = nspawn::gpu_vendor()
+                        ),
+                        _ => println!(
+                            "{} no GPU detected; launchers run without GPU passthrough",
+                            term::yellow("gpu:")
+                        ),
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
