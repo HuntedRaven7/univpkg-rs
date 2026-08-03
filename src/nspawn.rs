@@ -27,8 +27,6 @@ const SKELETON_LINKS: &[(&str, &str)] = &[
     ("lib64", "usr/lib64"),
 ];
 
-/// Which kind of package/container an entry belongs to. Deb and rpm apps live
-/// in separate nspawn containers under `~/.local/share/univ/{deb,rpm}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerKind {
     Deb,
@@ -44,8 +42,6 @@ impl ContainerKind {
     }
 }
 
-/// Determine which container a store path belongs to from its `Kind:` meta
-/// line. Packages without an explicit kind are treated as Debian.
 pub fn package_kind(sp: &crate::store::StorePath) -> ContainerKind {
     let meta = crate::store::Store::state_dir()
         .map(|dir| dir.join(sp.to_string()).join("meta"))
@@ -58,24 +54,16 @@ pub fn package_kind(sp: &crate::store::StorePath) -> ContainerKind {
     }
 }
 
-/// The systemd-nspawn container root for a package kind:
-/// `~/.local/share/univ/{deb,rpm}`.
 pub fn root(kind: ContainerKind) -> io::Result<PathBuf> {
     Ok(crate::store::Store::root()?.join(kind.name()))
 }
 
-/// Whether a container root has been set up yet.
 pub fn initialized() -> bool {
     [ContainerKind::Deb, ContainerKind::Rpm]
         .iter()
         .any(|k| root(*k).map(|r| r.join("usr").is_dir()).unwrap_or(false))
 }
 
-/// Create (idempotently) the minimal container root skeleton. The store is a
-/// sibling of the container (`~/.local/share/univ/store`), so package files
-/// are merged into the container tree as relative symlinks back into the
-/// store: those links resolve on the host *and* inside the container, where
-/// the store is bind-mounted read-only at `/store`.
 pub fn init(kind: ContainerKind) -> io::Result<()> {
     let root = root(kind)?;
     fs::create_dir_all(&root)?;
@@ -97,9 +85,6 @@ pub fn init(kind: ContainerKind) -> io::Result<()> {
     Ok(())
 }
 
-/// Map a package-relative path onto its location in the container tree. The
-/// skeleton aliases `bin`/`sbin`/`lib`/`lib64` to their `usr` counterparts, so
-/// files under those directories must be placed at the resolved `usr` paths.
 pub fn map_dest_rel(rel: &Path) -> PathBuf {
     let mut comps = rel.components();
     let first = comps.next();
@@ -115,17 +100,11 @@ pub fn map_dest_rel(rel: &Path) -> PathBuf {
     }
 }
 
-/// The container-absolute path for a package-relative executable, e.g.
-/// `usr/bin/foo` -> `/usr/bin/foo`.
 pub fn container_path_for(package_rel: &Path) -> String {
     let dest = map_dest_rel(package_rel);
     format!("/{}", dest.display())
 }
 
-/// Build the relative symlink target (from the container tree) pointing at a
-/// package file in the store. From `container/<dest_rel>` we need to climb up
-/// to the container's parent (where `store/` lives), so the number of `..`
-/// levels equals the number of components in `dest_rel`.
 fn symlink_target(sp: &StorePath, dest_rel: &Path, src_rel: &Path) -> PathBuf {
     let up = dest_rel.components().count();
     let mut target = PathBuf::new();
@@ -138,10 +117,6 @@ fn symlink_target(sp: &StorePath, dest_rel: &Path, src_rel: &Path) -> PathBuf {
     target
 }
 
-/// Merge every installed package into the container tree, creating symlinks
-/// for each file and real directories for each directory. Removes stale links
-/// that no longer point at an installed store path. Returns the number of
-/// links (re)created.
 pub fn rebuild_tree(store: &Store) -> io::Result<usize> {
     init(ContainerKind::Deb)?;
     init(ContainerKind::Rpm)?;
@@ -264,9 +239,6 @@ fn target_points_at_store(target: &Path) -> bool {
     seen_store
 }
 
-/// Whether an absolute FHS path (e.g. `/lib64/ld-linux-x86-64.so.2`) resolves
-/// in the container tree, falling back to the host filesystem when the
-/// container has not been initialized.
 pub fn on_filesystem(abs: &Path) -> bool {
     for kind in [ContainerKind::Deb, ContainerKind::Rpm] {
         if let Ok(root) = root(kind)
@@ -322,9 +294,6 @@ fn is_root() -> bool {
         .unwrap_or(false)
 }
 
-/// Run a command, re-invoking through `sudo` when not running as root so the
-/// base-OS install can write into the container root. Inherits stdio so the
-/// installer's progress is visible.
 fn run(cmd: &str, args: &[String]) -> io::Result<()> {
     run_with_env(cmd, args, &[])
 }
@@ -352,8 +321,6 @@ fn run_with_env(cmd: &str, args: &[String], envs: &[(&str, &str)]) -> io::Result
     }
 }
 
-/// Hand the container tree back to the invoking user after a root-owned
-/// bootstrap install.
 fn restore_ownership(root: &Path) -> io::Result<()> {
     if is_root() {
         return Ok(());
@@ -375,19 +342,12 @@ fn restore_ownership(root: &Path) -> io::Result<()> {
     run("chmod", &["u+w".to_string(), root.display().to_string()])
 }
 
-/// Whether a base OS has been installed into the container yet.
 pub fn bootstrapped(kind: ContainerKind) -> bool {
     root(kind)
         .map(|r| r.join(BOOTSTRAP_MARKER).is_file())
         .unwrap_or(false)
 }
 
-/// Install a minimal base OS into both containers, idempotently. The rpm
-/// container is built with `dnf --installroot`, the deb container with
-/// `debootstrap`. Requires root (re-run via `sudo`); each container tree is
-/// chown'd back to the invoking user afterwards. A container whose installer
-/// is unavailable on the host is skipped with a warning; real failures are
-/// reported together.
 pub fn bootstrap() -> io::Result<()> {
     let mut errors: Vec<String> = Vec::new();
     for kind in [ContainerKind::Deb, ContainerKind::Rpm] {
@@ -428,10 +388,6 @@ fn bootstrap_kind(kind: ContainerKind) -> io::Result<()> {
     Ok(())
 }
 
-/// Remove every symlink under `dir` (keeping real dirs and files). Used before
-/// bootstrapping: rpm and debootstrap refuse to write through pre-existing
-/// symlinks (e.g. our skeleton `lib64 -> usr/lib64`), so the base OS must
-/// create its own.
 fn clear_symlinks(dir: &Path) -> io::Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -532,8 +488,6 @@ fn deb_bootstrap(root: &Path) -> io::Result<()> {
 
 const DEFAULT_DEB_MIRROR: &str = "http://deb.debian.org/debian";
 
-/// Hosts with an apt ecosystem (debootstrap's natural habitat) vs a foreign
-/// one like Fedora, where we must pick the Debian suite/mirror ourselves.
 fn is_debian_like_host() -> bool {
     matches!(
         os_release_value("ID").unwrap_or_default().as_str(),
@@ -548,11 +502,6 @@ fn is_debian_like_host() -> bool {
     )
 }
 
-/// Obtain the debootstrap tool itself from the Debian archive (never the host
-/// package manager): download the `debootstrap` `.deb` from the configured
-/// deb repo, extract it into the univ cache with our own unpacker, and return
-/// the path to its `debootstrap` script. It is plain shell + perl, so it runs
-/// on any host that has `sh`, `tar`, `wget`/`curl` and `ar`.
 fn fetch_debootstrap() -> io::Result<(String, String)> {
     let cache = crate::store::Store::root()?.join("cache").join("debootstrap");
     let bin = cache.join("usr/sbin/debootstrap");
@@ -574,7 +523,6 @@ fn fetch_debootstrap() -> io::Result<(String, String)> {
     ))
 }
 
-/// Pick the first `deb` URI from the apt sources as the debootstrap mirror.
 fn apt_mirror() -> io::Result<String> {
     let mut files = vec![PathBuf::from("/etc/apt/sources.list")];
     if let Ok(dir) = fs::read_dir("/etc/apt/sources.list.d") {
@@ -600,8 +548,6 @@ fn apt_mirror() -> io::Result<String> {
     ))
 }
 
-/// Generate the host launcher script for a binary, which runs it inside the
-/// systemd-nspawn container with the store bind-mounted read-only at `/store`.
 pub fn launcher(target: &str, container_root: &Path, store_base: &Path) -> String {
     let c = shell_escape(&container_root.to_string_lossy());
     let s = shell_escape(&store_base.to_string_lossy());

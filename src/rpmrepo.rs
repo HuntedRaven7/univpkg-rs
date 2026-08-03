@@ -218,7 +218,6 @@ pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether a repo with this name is already present in the conf file.
 fn repo_configured(conf: &Path, name: &str) -> bool {
     fs::read_to_string(conf)
         .map(|text| {

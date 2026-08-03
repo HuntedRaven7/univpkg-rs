@@ -79,9 +79,6 @@ fn read_control(name: &str, bytes: &[u8]) -> io::Result<DebMeta> {
     Err(invalid("control.tar has no `control` file"))
 }
 
-/// Extract a `.deb`'s data payload into `dir` without touching the store.
-/// Used for host-side helpers shipped from the Debian archive (e.g. the
-/// debootstrap scripts).
 pub fn extract_to(deb: &[u8], dir: &Path) -> io::Result<DebMeta> {
     let (control_name, control) = member(deb, "control.tar")?
         .ok_or_else(|| invalid("no control.tar member in archive"))?;

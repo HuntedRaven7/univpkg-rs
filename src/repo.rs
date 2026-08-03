@@ -225,7 +225,6 @@ pub fn add_repo(name: &str, base: &str, arches: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether a repo with this name is already present in the conf file.
 fn repo_configured(conf: &Path, name: &str) -> bool {
     fs::read_to_string(conf)
         .map(|text| {
@@ -565,9 +564,6 @@ pub fn repo_for(name: &str) -> Option<Repo> {
     })
 }
 
-/// Download a single package's `.deb` from whichever configured deb repo
-/// contains it, without installing it into the store. Used for host-side
-/// helpers like debootstrap.
 pub fn fetch(name: &str) -> io::Result<Vec<u8>> {
     let repo = repo_for(name).ok_or_else(|| {
         io::Error::new(

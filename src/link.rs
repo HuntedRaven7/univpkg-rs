@@ -335,10 +335,6 @@ fn write_desktop(dest: &Path, text: &str) -> io::Result<()> {
     fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
 }
 
-/// Binaries that count as user-facing "apps" for a package: those referenced
-/// by the package's `.desktop` `Exec=`/`TryExec=` plus anything that matches
-/// the package name itself. Helper binaries are still merged into the container
-/// tree but get no host launcher.
 fn app_binaries(store_path: &Path) -> HashSet<String> {
     let mut apps = HashSet::new();
     if let Ok(entries) = fs::read_dir(store_path.join("usr/share/applications")) {

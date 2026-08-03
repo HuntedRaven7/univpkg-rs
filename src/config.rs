@@ -1,6 +1,3 @@
-//! Declarative `.kdl` configuration: declares repos and the packages to
-//! install from them. Installs flow through the same path as `univ install`,
-//! so packages are merged into the nspawn container tree and get launchers.
 
 use crate::deb::DebMeta;
 use crate::store::{Store, StorePath};
@@ -9,7 +6,6 @@ use crate::{link, repo, rpmrepo};
 use std::io;
 use std::path::Path;
 
-/// Apply a declarative `.kdl` configuration file.
 pub fn process_file(path: &str) -> io::Result<()> {
     let content = std::fs::read_to_string(path)?;
     let doc: kdl::KdlDocument = content
@@ -158,8 +154,6 @@ fn install_packages(
     Ok(())
 }
 
-/// Record installs in the store *and* integrate them with the nspawn container:
-/// merge the files into the container tree and create host launchers.
 fn link_all(store: &Store, installed: &[(StorePath, DebMeta)]) {
     for (sp, meta) in installed {
         println!(
