@@ -323,22 +323,6 @@ pub fn gpu_vendor() -> &'static str {
     })
 }
 
-// NVIDIA userspace libraries the loader/linker needs inside the container.
-//
-// Broader than a plain "libnvidia*.so.*" match: also picks up libcuda (CUDA/compute
-// workloads), libnvcuvid (hardware video decode) and libnvoptix (RTX/OptiX), and
-// matches "*.so*" rather than "*.so.*" so unversioned .so stubs aren't missed
-// (distrobox hit exactly this as a real CUDA-detection bug: 89luca89/distrobox#1764).
-//
-// Each glob only ever reads from one arch's real host directory (x86_64-linux-gnu /
-// lib64 for 64-bit, i386-linux-gnu / lib32 for 32-bit) and is bound into the
-// destinations for that *same* arch class only, mirrored into both the
-// Debian-multiarch and Fedora/RPM-style target paths since a single generated
-// launcher script is shared between both container kinds and doesn't know at
-// generation time which root it'll end up running against. Previously every
-// matched lib (including 32-bit ones) was bound into both the 64-bit
-// x86_64-linux-gnu path and lib64, which would silently hand a 32-bit .so to
-// something expecting a 64-bit one on any host with real i386 nvidia libs present.
 fn nvidia_libs() -> String {
     let mut out = String::new();
     out.push_str(
@@ -360,20 +344,6 @@ fn nvidia_libs() -> String {
     out
 }
 
-// Non-library runtime bits the loaders discover by fixed path rather than the
-// linker: Vulkan ICD/layer JSON, the GLVND EGL vendor JSON, and OpenCL vendor
-// files. Without these, Vulkan/EGL/OpenCL applications can't find the driver
-// even once the libraries above are present, since those loaders don't search
-// LD_LIBRARY_PATH, they read one specific config directory.
-//
-// Known gap, flagged rather than silently assumed correct: some of these JSON
-// files hard-code an absolute host "library_path". distrobox rewrites that
-// path to a bare soname before mirroring the file in so it resolves against
-// the guest's linker cache; this just bind-mounts the file verbatim, so an ICD
-// with an absolute library_path may still fail to resolve inside the
-// container. Rewriting it would mean writing a scratch copy to a temp dir from
-// inside this generated shell script, which is a real chunk of added
-// complexity, left for a follow-up rather than bundled into this pass.
 fn nvidia_confs() -> &'static str {
     "\tfor conf in /usr/share/glvnd/egl_vendor.d/*nvidia* /usr/share/vulkan/icd.d/*nvidia* /etc/vulkan/icd.d/*nvidia* /usr/share/vulkan/implicit_layer.d/*nvidia* /etc/vulkan/implicit_layer.d/*nvidia* /etc/OpenCL/vendors/*nvidia*; do\n\
      \t\t[ -e \"$conf\" ] && BINDS=\"$BINDS --bind-ro=$conf:$conf\"\n\
@@ -691,13 +661,6 @@ fn apt_mirror() -> io::Result<String> {
     ))
 }
 
-// Read-only host-identity files worth mirroring into every container regardless
-// of GPU/X11/audio integration: without these, DNS resolution, hostname-based
-// tooling and anything reading the local timezone can silently misbehave inside
-// the container even though everything else works. Each is optional and only
-// bound if it actually exists on the host (e.g. resolv.conf may be a dangling
-// systemd-resolved stub path on some hosts). Mirrors distrobox's own default
-// HOST_MOUNTS_RO list (89luca89/distrobox distrobox-init).
 fn host_identity_binds() -> &'static str {
     "\t[ -e /etc/resolv.conf ] && BINDS=\"$BINDS --bind-ro=/etc/resolv.conf:/etc/resolv.conf\"\n\
      \t[ -e /etc/machine-id ] && BINDS=\"$BINDS --bind-ro=/etc/machine-id:/etc/machine-id\"\n\
