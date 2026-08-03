@@ -257,6 +257,34 @@ fn nspawn_bin() -> String {
     std::env::var("UNIV_NSPAWN").unwrap_or_else(|_| "systemd-nspawn".to_string())
 }
 
+// WORKAROUND, REMOVE ONCE UPSTREAM IS FIXED: rootless systemd-nspawn's default
+// "managed" --private-users mode allocates its UID range via a varlink call to
+// systemd-nsresourced, and that call can fail or hang outright on affected
+// systemd versions (259 confirmed first-hand; likely others) — this is an open
+// upstream bug, not anything wrong in a user's setup:
+// https://github.com/systemd/systemd/issues/35387
+//
+// There's no single --private-users value that's been confirmed to reliably
+// work around it for everyone (people in that issue report different results
+// with =no / =pick / =identity depending on their exact systemd version and
+// container flags), so rather than silently picking one and potentially
+// trading this failure for a different one, this emits a shell snippet that
+// checks UNIV_NSPAWN_PRIVATE_USERS *at launch time* (not baked in when this
+// launcher script is generated) and passes it straight through as
+// --private-users=<value> if set. Read at launch time rather than generation
+// time so a user hit by the bug can work around it by exporting the var,
+// without needing to regenerate every launcher script first.
+//
+// DELETE THIS FUNCTION (and its call site in `launcher`) once
+// systemd/systemd#35387 is resolved and plain rootless nspawn works again
+// without needing a manual override — it exists only because of that bug.
+fn private_users_override_snippet() -> &'static str {
+    "PRIVATE_USERS=\"\"\n\
+     if [ -n \"${UNIV_NSPAWN_PRIVATE_USERS:-}\" ]; then\n\
+     \tPRIVATE_USERS=\"--private-users=${UNIV_NSPAWN_PRIVATE_USERS}\"\n\
+     fi\n"
+}
+
 pub fn has_nvidia() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -700,9 +728,11 @@ pub fn launcher(target: &str, container_root: &Path, store_base: &Path) -> Strin
          fi\n\
          {host_identity}\
          {nvidia}\
-         exec {nspawn} --quiet --directory=\"$CONTAINER\" --bind-ro=\"$STORE:/store\" $BINDS --chdir=/ -- \"{t}\" \"$@\"\n",
+         {private_users}\
+         exec {nspawn} --quiet $PRIVATE_USERS --directory=\"$CONTAINER\" --bind-ro=\"$STORE:/store\" $BINDS --chdir=/ -- \"{t}\" \"$@\"\n",
         nspawn = nspawn_bin(),
         host_identity = host_identity_binds(),
+        private_users = private_users_override_snippet(),
     )
 }
 
@@ -894,6 +924,29 @@ mod tests {
         assert!(confs.contains("vulkan/icd.d"));
         assert!(confs.contains("vulkan/implicit_layer.d"));
         assert!(confs.contains("OpenCL/vendors"));
+    }
+
+    // Workaround for systemd/systemd#35387 (rootless nspawn's managed
+    // --private-users varlink allocation can fail/hang on affected systemd
+    // versions). Remove this test along with `private_users_override_snippet`
+    // and its call site in `launcher` once that upstream issue is fixed.
+    #[test]
+    fn private_users_override_snippet_reads_env_at_launch_time_not_generation_time() {
+        let snippet = private_users_override_snippet();
+        assert!(snippet.contains("UNIV_NSPAWN_PRIVATE_USERS"));
+        assert!(snippet.contains("--private-users=${UNIV_NSPAWN_PRIVATE_USERS}"));
+    }
+
+    #[test]
+    fn launcher_wires_private_users_override_into_the_nspawn_invocation() {
+        with_home("private-users", |home| {
+            let root = root(ContainerKind::Deb).unwrap();
+            let store_base = home.join(".local/share/univ/store");
+            let script = launcher("/usr/bin/hello", &root, &store_base);
+            assert!(script.contains("PRIVATE_USERS=\"\""));
+            assert!(script.contains("UNIV_NSPAWN_PRIVATE_USERS"));
+            assert!(script.contains("--quiet $PRIVATE_USERS --directory="));
+        });
     }
 
     #[test]
