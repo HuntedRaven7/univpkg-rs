@@ -131,7 +131,7 @@ impl Txn {
             .iter()
             .any(|op| matches!(op, Op::AddStorePath(_) | Op::RemoveStorePath { .. }))
         {
-            let _ = crate::nspawn::rebuild_tree(&self.store);
+            let _ = crate::crun::rebuild_tree(&self.store);
         }
         Ok(())
     }

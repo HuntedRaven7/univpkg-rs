@@ -30,9 +30,9 @@ pub struct Linked {
 
 pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result<Linked> {
     let home = Store::home_dir()?;
-    let kind = crate::nspawn::package_kind(sp);
+    let kind = crate::crun::package_kind(sp);
     let store_path = store.base().join(sp.to_string());
-    let bin_dir = home.join(".local").join("bin");
+    let bin_dir = home.join(".local").join("bin").join(kind.name());
     let apps_dir = home.join(".local").join("share").join("applications");
     let icons_dir = home.join(".local").join("share").join("icons");
     let pixmaps_dir = home.join(".local").join("share").join("pixmaps");
@@ -60,7 +60,7 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
             Ok(r) => r.to_path_buf(),
             Err(_) => continue,
         };
-        let target = crate::nspawn::container_path_for(&rel);
+        let target = crate::crun::container_path_for(&rel);
         match install_launcher(&dest, &target, kind, store) {
             Ok(()) => {
                 wrapped.insert(name.clone(), dest.clone());
@@ -78,7 +78,7 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
         if let Some(path) = find_executable_by_name(&store_path, &name) {
             let dest = bin_dir.join(&name);
             let rel = path.strip_prefix(&store_path).unwrap_or(&path).to_path_buf();
-            let target = crate::nspawn::container_path_for(&rel);
+            let target = crate::crun::container_path_for(&rel);
             if let Err(e) = install_launcher(&dest, &target, kind, store) {
                 eprintln!("univ: warning: not linking fallback {}: {}", name, e);
                 continue;
@@ -94,7 +94,7 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
         if let Some(path) = find_executable_by_name(&store_path, &meta.package) {
             let dest = bin_dir.join(&meta.package);
             let rel = path.strip_prefix(&store_path).unwrap_or(&path).to_path_buf();
-            let target = crate::nspawn::container_path_for(&rel);
+            let target = crate::crun::container_path_for(&rel);
             if let Err(e) = install_launcher(&dest, &target, kind, store) {
                 eprintln!("univ: warning: not linking {}: {}", meta.package, e);
             } else {
@@ -158,8 +158,8 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
     }
 
     write_manifest(sp, &manifest)?;
-    crate::nspawn::rebuild_tree(store)?;
-    if !crate::nspawn::bootstrapped(kind) {
+    crate::crun::rebuild_tree(store)?;
+    if !crate::crun::bootstrapped(kind) {
         eprintln!(
             "univ: warning: the {} container has no base OS yet; run `univ bootstrap` \
              (needs root) so installed programs can run inside it",
@@ -265,7 +265,7 @@ fn remove_orphans(store: &Store) -> Vec<String> {
         removed.push(name);
     }
     let _ = lock.save();
-    let _ = crate::nspawn::rebuild_tree(store);
+    let _ = crate::crun::rebuild_tree(store);
     removed
 }
 
@@ -445,21 +445,24 @@ pub fn find_binaries(store_path: &Path) -> io::Result<Vec<PathBuf>> {
 fn install_launcher(
     dest: &Path,
     target: &str,
-    kind: crate::nspawn::ContainerKind,
+    kind: crate::crun::ContainerKind,
     store: &Store,
 ) -> io::Result<()> {
-    let container_root = crate::nspawn::root(kind)?;
-    let text = crate::nspawn::launcher(target, &container_root, store.base());
+    let container_root = crate::crun::root(kind)?;
+    let text = crate::crun::launcher(target, &container_root, store.base());
     match fs::symlink_metadata(dest) {
         Ok(md) if md.file_type().is_symlink() => {
             let _ = fs::remove_file(dest);
         }
         Ok(_) => {
             let existing = fs::read_to_string(dest).unwrap_or_default();
-            if !existing.contains(crate::nspawn::LAUNCHER_MARKER) {
+            if !crate::crun::is_univ_launcher(&existing) {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    format!("{} already exists and is not managed by univ", dest.display()),
+                    format!(
+                        "{} already exists and is not managed by univ",
+                        dest.display()
+                    ),
                 ));
             }
         }
@@ -754,19 +757,20 @@ mod tests {
             fake_store_path(store, &sp);
             let linked = link_package(store, &sp, &meta()).unwrap();
 
-            assert_eq!(linked.bin_links, vec![home.join(".local/bin/foo")]);
-            let launcher = home.join(".local/bin/foo");
+            assert_eq!(linked.bin_links, vec![home.join(".local/bin/deb/foo")]);
+            let launcher = home.join(".local/bin/deb/foo");
             assert!(launcher.is_file(), "launcher must be a script");
             let script = fs::read_to_string(&launcher).unwrap();
             assert!(
                 script.starts_with("#!/bin/sh")
-                    && script.contains(crate::nspawn::LAUNCHER_MARKER),
+                    && script.contains(crate::crun::LAUNCHER_MARKER),
                 "{script}"
             );
-            assert!(script.contains("systemd-nspawn --quiet"));
-            assert!(script.contains("-- \"/usr/bin/foo\""), "{script}");
+            assert!(script.contains("crun --rootless=true run"));
+            assert!(script.contains("--bundle \"$BUNDLE\""), "{script}");
+            assert!(script.contains("TARGET=\"/usr/bin/foo\""), "{script}");
 
-            let container = crate::nspawn::root(crate::nspawn::ContainerKind::Deb).unwrap();
+            let container = crate::crun::root(crate::crun::ContainerKind::Deb).unwrap();
             let tree_link = container.join("usr/bin/foo");
             assert!(
                 tree_link.is_symlink(),
@@ -827,8 +831,8 @@ mod tests {
             fs::write(&helper, "#!/bin/sh\necho helper\n").unwrap();
             fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
             let linked = link_package(store, &sp, &meta()).unwrap();
-            assert_eq!(linked.bin_links, vec![home.join(".local/bin/foo")]);
-            assert!(!home.join(".local/bin/foo-helper").exists());
+            assert_eq!(linked.bin_links, vec![home.join(".local/bin/deb/foo")]);
+            assert!(!home.join(".local/bin/deb/foo-helper").exists());
             Ok(())
         });
     }
@@ -850,8 +854,8 @@ mod tests {
             assert_eq!(paths, 1);
             assert!(orphans.is_empty());
             assert!(!store_root.exists());
-            assert!(!home.join(".local/bin/foo").exists());
-            assert!(!crate::nspawn::root(crate::nspawn::ContainerKind::Deb)
+            assert!(!home.join(".local/bin/deb/foo").exists());
+            assert!(!crate::crun::root(crate::crun::ContainerKind::Deb)
                 .unwrap()
                 .join("usr/bin/foo")
                 .exists());
@@ -953,13 +957,35 @@ mod tests {
         with_env("foreign", |store, home| {
             let sp = sp();
             fake_store_path(store, &sp);
-            let bin_dir = home.join(".local/bin");
+            let bin_dir = home.join(".local/bin/deb");
             fs::create_dir_all(&bin_dir).unwrap();
             fs::write(bin_dir.join("foo"), b"user file").unwrap();
 
             let linked = link_package(store, &sp, &meta()).unwrap();
             assert!(linked.bin_links.is_empty(), "must skip foreign file");
             assert_eq!(fs::read(bin_dir.join("foo")).unwrap(), b"user file");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn upgrades_legacy_nspawn_launchers() {
+        with_env("migrate", |store, home| {
+            let sp = sp();
+            fake_store_path(store, &sp);
+            let launcher = home.join(".local/bin/deb/foo");
+            fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+            fs::write(&launcher, "#!/bin/sh\n# univ nspawn launcher v2\n").unwrap();
+
+            let linked = link_package(store, &sp, &meta()).unwrap();
+            assert_eq!(linked.bin_links, vec![launcher.clone()]);
+            let script = fs::read_to_string(&launcher).unwrap();
+            assert!(
+                script.contains(crate::crun::LAUNCHER_MARKER)
+                    && script.contains("crun --rootless=true run")
+                    && !script.contains("systemd-nspawn"),
+                "{script}"
+            );
             Ok(())
         });
     }

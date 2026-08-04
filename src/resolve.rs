@@ -56,9 +56,9 @@ pub fn installed_packages(store: &Store) -> Vec<Installed> {
 
 pub fn system_library(soname: &str, class: u8, machine: u16) -> Option<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    if crate::nspawn::initialized() {
-        for kind in [crate::nspawn::ContainerKind::Deb, crate::nspawn::ContainerKind::Rpm] {
-            if let Ok(r) = crate::nspawn::root(kind) {
+    if crate::crun::initialized() {
+        for kind in [crate::crun::ContainerKind::Deb, crate::crun::ContainerKind::Rpm] {
+            if let Ok(r) = crate::crun::root(kind) {
                 roots.push(r);
             }
         }

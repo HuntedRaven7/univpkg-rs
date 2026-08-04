@@ -1,9 +1,12 @@
+#[cfg(test)]
+mod launcher_dump;
+
 mod deb;
 mod elf;
 mod link;
 mod lock;
 mod config;
-mod nspawn;
+mod crun;
 mod profile;
 mod repo;
 mod resolve;
@@ -49,8 +52,8 @@ fn main() -> ExitCode {
         "init" => {
             let result: io::Result<()> = (|| {
                 let _s = store::Store::init()?;
-                nspawn::init(nspawn::ContainerKind::Deb)?;
-                nspawn::init(nspawn::ContainerKind::Rpm)?;
+                crun::init(crun::ContainerKind::Deb)?;
+                crun::init(crun::ContainerKind::Rpm)?;
                 repo::ensure_default_repo()?;
                 rpmrepo::ensure_default_repo()?;
                 ensure_bashrc()?;
@@ -68,12 +71,12 @@ fn main() -> ExitCode {
                         )
                     );
                     println!("{}", term::bold("containers:"));
-                    for kind in [nspawn::ContainerKind::Deb, nspawn::ContainerKind::Rpm] {
+                    for kind in [crun::ContainerKind::Deb, crun::ContainerKind::Rpm] {
                         println!(
                             "  {} -> {}",
                             term::bold_cyan(kind.name()),
                             term::cyan(
-                                &nspawn::root(kind)
+                                &crun::root(kind)
                                     .map(|r| r.display().to_string())
                                     .unwrap_or_default()
                             )
@@ -138,12 +141,12 @@ fn main() -> ExitCode {
                     } else {
                         println!("{} {indexed} packages", term::bold_green("indexed"));
                     }
-                    match nspawn::bootstrap() {
+                    match crun::bootstrap() {
                         Ok(()) => {}
                         Err(e) => eprintln!("{}", term::warn(&format!("bootstrap incomplete: {e}"))),
                     }
-                    for kind in [nspawn::ContainerKind::Deb, nspawn::ContainerKind::Rpm] {
-                        let label = if nspawn::bootstrapped(kind) {
+                    for kind in [crun::ContainerKind::Deb, crun::ContainerKind::Rpm] {
+                        let label = if crun::bootstrapped(kind) {
                             term::bold_green("bootstrapped").to_string()
                         } else {
                             term::yellow("no base OS yet (run `univ bootstrap`)").to_string()
@@ -154,7 +157,7 @@ fn main() -> ExitCode {
                             term::bold_cyan(kind.name())
                         );
                     }
-                    match nspawn::gpu_vendor() {
+                    match crun::gpu_vendor() {
                         "nvidia" => println!(
                             "{} NVIDIA driver detected: launchers bind GPU devices and driver libs",
                             term::bold_green("gpu:")
@@ -166,7 +169,7 @@ fn main() -> ExitCode {
                         "intel" | "amd" => println!(
                             "{} {vendor} GPU detected",
                             term::bold_cyan("gpu:"),
-                            vendor = nspawn::gpu_vendor()
+                            vendor = crun::gpu_vendor()
                         ),
                         _ => println!(
                             "{} no GPU detected; launchers run without GPU passthrough",
@@ -197,10 +200,10 @@ fn main() -> ExitCode {
                 }
             }
         }
-        "bootstrap" => match nspawn::bootstrap() {
+        "bootstrap" => match crun::bootstrap() {
             Ok(()) => {
-                for kind in [nspawn::ContainerKind::Deb, nspawn::ContainerKind::Rpm] {
-                    let label = if nspawn::bootstrapped(kind) {
+                for kind in [crun::ContainerKind::Deb, crun::ContainerKind::Rpm] {
+                    let label = if crun::bootstrapped(kind) {
                         term::bold_green("bootstrapped").to_string()
                     } else {
                         term::yellow("no base OS yet").to_string()
@@ -210,7 +213,7 @@ fn main() -> ExitCode {
                         term::bold("container"),
                         term::bold_cyan(kind.name()),
                         term::cyan(
-                            &nspawn::root(kind)
+                            &crun::root(kind)
                                 .map(|r| r.display().to_string())
                                 .unwrap_or_default()
                         )
@@ -579,7 +582,7 @@ fn main() -> ExitCode {
             for bin in bins {
                 println!("{}:", bin.display());
                 if let Some(interp) = resolve::interpreter(&bin) {
-                    let status = if nspawn::on_filesystem(std::path::Path::new(&interp)) {
+                    let status = if crun::on_filesystem(std::path::Path::new(&interp)) {
                         "ok"
                     } else {
                         "MISSING"
@@ -888,8 +891,8 @@ fn installed_line(meta: &deb::DebMeta) -> String {
 fn print_help() {
     println!("univ - a content-addressed package manager");
     println!();
-    println!("packages are installed into a systemd-nspawn container (~/.local/univ/container)");
-    println!("and run via nspawn launchers in ~/.local/bin, keeping the host filesystem clean");
+    println!("packages are installed into a crun-backed container root (~/.local/univ/container)");
+    println!("and run via crun launchers in ~/.local/bin/{{deb,rpm}}, keeping the host filesystem clean");
     println!();
     println!("usage: univ <command> [args]");
     println!();
@@ -1129,21 +1132,31 @@ fn warn_unknown(pkgs: &[String]) {
 
 fn report_linked(linked: &link::Linked) {
     if !linked.bin_links.is_empty() {
-        println!("{}", term::bold("linked into ~/.local/bin:"));
-        for b in &linked.bin_links {
-            println!("  {}", term::cyan(&b.display().to_string()));
-        }
-        let bin_dir = store::Store::home_dir()
-            .map(|h| h.join(".local").join("bin"))
-            .unwrap_or_default();
-        if !on_path(&bin_dir) {
-            println!(
-                "{}",
-                term::yellow(&format!(
-                    "note: {} is not on $PATH; add it to run these from a terminal",
-                    bin_dir.display()
-                ))
-            );
+        let mut dirs: Vec<std::path::PathBuf> = linked
+            .bin_links
+            .iter()
+            .filter_map(|b| b.parent().map(|p| p.to_path_buf()))
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        for bin_dir in &dirs {
+            println!("{}", term::bold(&format!("linked into {}:", bin_dir.display())));
+            for b in linked
+                .bin_links
+                .iter()
+                .filter(|b| b.parent() == Some(bin_dir.as_path()))
+            {
+                println!("  {}", term::cyan(&b.display().to_string()));
+            }
+            if !on_path(bin_dir) {
+                println!(
+                    "{}",
+                    term::yellow(&format!(
+                        "note: {} is not on $PATH; add it to run these from a terminal",
+                        bin_dir.display()
+                    ))
+                );
+            }
         }
     }
     if !linked.desktop_files.is_empty() {
@@ -1342,21 +1355,33 @@ fn ensure_bashrc() -> io::Result<()> {
     let home = store::Store::home_dir().unwrap_or_default();
     let rc = home.join(".bashrc");
     let existing = std::fs::read_to_string(&rc).unwrap_or_default();
-    if existing.contains(BASHRC_START) && existing.contains(BASHRC_END) {
+    let bin_dirs: Vec<std::path::PathBuf> = [crun::ContainerKind::Deb, crun::ContainerKind::Rpm]
+        .iter()
+        .map(|k| home.join(".local").join("bin").join(k.name()))
+        .collect();
+    let mut block = String::from(BASHRC_START);
+    block.push_str("\n# managed by univ init (see `univ --help`)\n");
+    for d in &bin_dirs {
+        block.push_str(&format!(
+            "export PATH=\"{}:${{PATH:+:$PATH}}\"\n",
+            d.display()
+        ));
+    }
+    block.push_str(BASHRC_END);
+    block.push('\n');
+
+    let mut text = existing.clone();
+    if let (Some(start), Some(end)) = (text.find(BASHRC_START), text.find(BASHRC_END)) {
+        text.replace_range(start..end + BASHRC_END.len(), &block.trim_end_matches('\n'));
+    } else {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&block);
+    }
+    if text == existing {
         return Ok(());
     }
-    let bin_dir = home.join(".local/bin");
-    let mut text = existing;
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(&format!(
-        "{BASHRC_START}\n\
-         # managed by univ init (see `univ --help`)\n\
-         export PATH=\"{}:${{PATH:+:$PATH}}\"\n\
-         {BASHRC_END}\n",
-        bin_dir.display()
-    ));
     std::fs::write(&rc, text)?;
     println!(
         "{} {}",

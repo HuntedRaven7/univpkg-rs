@@ -7,7 +7,13 @@ use std::sync::OnceLock;
 
 use crate::store::{Store, StorePath};
 
-pub const LAUNCHER_MARKER: &str = "# univ nspawn launcher v2";
+pub const LAUNCHER_MARKER: &str = "# univ crun launcher v2";
+
+const LEGACY_LAUNCHER_MARKERS: &[&str] = &["# univ nspawn launcher v2"];
+
+pub fn is_univ_launcher(text: &str) -> bool {
+    text.contains(LAUNCHER_MARKER) || LEGACY_LAUNCHER_MARKERS.iter().any(|m| text.contains(m))
+}
 
 const SKELETON_DIRS: &[&str] = &[
     "usr",
@@ -253,36 +259,8 @@ pub fn on_filesystem(abs: &Path) -> bool {
     abs.exists()
 }
 
-fn nspawn_bin() -> String {
-    std::env::var("UNIV_NSPAWN").unwrap_or_else(|_| "systemd-nspawn".to_string())
-}
-
-// WORKAROUND, REMOVE ONCE UPSTREAM IS FIXED: rootless systemd-nspawn's default
-// "managed" --private-users mode allocates its UID range via a varlink call to
-// systemd-nsresourced, and that call can fail or hang outright on affected
-// systemd versions (259 confirmed first-hand; likely others) — this is an open
-// upstream bug, not anything wrong in a user's setup:
-// https://github.com/systemd/systemd/issues/35387
-//
-// There's no single --private-users value that's been confirmed to reliably
-// work around it for everyone (people in that issue report different results
-// with =no / =pick / =identity depending on their exact systemd version and
-// container flags), so rather than silently picking one and potentially
-// trading this failure for a different one, this emits a shell snippet that
-// checks UNIV_NSPAWN_PRIVATE_USERS *at launch time* (not baked in when this
-// launcher script is generated) and passes it straight through as
-// --private-users=<value> if set. Read at launch time rather than generation
-// time so a user hit by the bug can work around it by exporting the var,
-// without needing to regenerate every launcher script first.
-//
-// DELETE THIS FUNCTION (and its call site in `launcher`) once
-// systemd/systemd#35387 is resolved and plain rootless nspawn works again
-// without needing a manual override — it exists only because of that bug.
-fn private_users_override_snippet() -> &'static str {
-    "PRIVATE_USERS=\"\"\n\
-     if [ -n \"${UNIV_NSPAWN_PRIVATE_USERS:-}\" ]; then\n\
-     \tPRIVATE_USERS=\"--private-users=${UNIV_NSPAWN_PRIVATE_USERS}\"\n\
-     fi\n"
+fn crun_bin() -> String {
+    std::env::var("UNIV_CRUN").unwrap_or_else(|_| "crun".to_string())
 }
 
 pub fn has_nvidia() -> bool {
@@ -325,45 +303,45 @@ pub fn gpu_vendor() -> &'static str {
 
 fn nvidia_libs() -> String {
     let mut out = String::new();
-    out.push_str(
-        "\tfor lib in /usr/lib/x86_64-linux-gnu/lib*nvidia*.so* /usr/lib/x86_64-linux-gnu/libcuda*.so* /usr/lib/x86_64-linux-gnu/libnvcuvid* /usr/lib/x86_64-linux-gnu/libnvoptix* /usr/lib64/lib*nvidia*.so* /usr/lib64/libcuda*.so* /usr/lib64/libnvcuvid* /usr/lib64/libnvoptix*; do\n\
-         \t\tif [ -e \"$lib\" ]; then\n\
-         \t\t\tb=${lib##*/}\n\
-         \t\t\tBINDS=\"$BINDS --bind=$lib:/usr/lib/x86_64-linux-gnu/$b --bind=$lib:/usr/lib64/$b\"\n\
-         \t\tfi\n\
-         \tdone\n",
-    );
-    out.push_str(
-        "\tfor lib in /usr/lib/i386-linux-gnu/lib*nvidia*.so* /usr/lib/i386-linux-gnu/libcuda*.so* /usr/lib32/lib*nvidia*.so* /usr/lib32/libcuda*.so*; do\n\
-         \t\tif [ -e \"$lib\" ]; then\n\
-         \t\t\tb=${lib##*/}\n\
-         \t\t\tBINDS=\"$BINDS --bind=$lib:/usr/lib/i386-linux-gnu/$b --bind=$lib:/usr/lib32/$b\"\n\
-         \t\tfi\n\
-         \tdone\n",
-    );
+    out.push_str(r#"	for lib in /usr/lib/x86_64-linux-gnu/lib*nvidia*.so* /usr/lib/x86_64-linux-gnu/libcuda*.so* /usr/lib/x86_64-linux-gnu/libnvcuvid* /usr/lib/x86_64-linux-gnu/libnvoptix* /usr/lib64/lib*nvidia*.so* /usr/lib64/libcuda*.so* /usr/lib64/libnvcuvid* /usr/lib64/libnvoptix*; do
+		if [ -e "$lib" ]; then
+			b=${lib##*/}
+			append_mount "/usr/lib/x86_64-linux-gnu/$b" "$lib" ro
+			append_mount "/usr/lib64/$b" "$lib" ro
+		fi
+	done
+"#);
+    out.push_str(r#"	for lib in /usr/lib/i386-linux-gnu/lib*nvidia*.so* /usr/lib/i386-linux-gnu/libcuda*.so* /usr/lib32/lib*nvidia*.so* /usr/lib32/libcuda*.so*; do
+		if [ -e "$lib" ]; then
+			b=${lib##*/}
+			append_mount "/usr/lib/i386-linux-gnu/$b" "$lib" ro
+			append_mount "/usr/lib32/$b" "$lib" ro
+		fi
+	done
+"#);
     out
 }
 
 fn nvidia_confs() -> &'static str {
-    "\tfor conf in /usr/share/glvnd/egl_vendor.d/*nvidia* /usr/share/vulkan/icd.d/*nvidia* /etc/vulkan/icd.d/*nvidia* /usr/share/vulkan/implicit_layer.d/*nvidia* /etc/vulkan/implicit_layer.d/*nvidia* /etc/OpenCL/vendors/*nvidia*; do\n\
-     \t\t[ -e \"$conf\" ] && BINDS=\"$BINDS --bind-ro=$conf:$conf\"\n\
-     \tdone\n"
+    r#"	for conf in /usr/share/glvnd/egl_vendor.d/*nvidia* /usr/share/vulkan/icd.d/*nvidia* /etc/vulkan/icd.d/*nvidia* /usr/share/vulkan/implicit_layer.d/*nvidia* /etc/vulkan/implicit_layer.d/*nvidia* /etc/OpenCL/vendors/*nvidia*; do
+		[ -e "$conf" ] && append_mount "$conf" "$conf" ro
+	done
+"#
 }
 
 fn nvidia_block() -> String {
     format!(
-        "if [ -r /proc/driver/nvidia/version ]; then\n\
-         \tBINDS=\"$BINDS --bind-ro=/proc/driver/nvidia:/proc/driver/nvidia\"\n\
-         \tfor d in /dev/nvidia*; do\n\
-         \t\t[ -e \"$d\" ] && BINDS=\"$BINDS --bind=$d:$d\"\n\
-         \tdone\n\
-         \t[ -d /dev/dri ] && BINDS=\"$BINDS --bind=/dev/dri:/dev/dri\"\n\
-         \tfor bin in /usr/bin/nvidia-smi /usr/bin/nvidia-debugdump /usr/bin/nvidia-persistenced /usr/bin/nvidia-cuda-mps-control /usr/bin/nvidia-cuda-mps-server; do\n\
-         \t\t[ -x \"$bin\" ] && BINDS=\"$BINDS --bind-ro=$bin:$bin\"\n\
-         \tdone\n\
-         {confs}\
-         {libs}\
-         fi\n",
+        r#"if [ -r /proc/driver/nvidia/version ]; then
+	append_mount "/proc/driver/nvidia" "/proc/driver/nvidia" ro
+	for d in /dev/nvidia*; do
+		[ -e "$d" ] && append_mount "$d" "$d" rw
+	done
+	[ -d /dev/dri ] && append_mount "/dev/dri" "/dev/dri" rw
+	for bin in /usr/bin/nvidia-smi /usr/bin/nvidia-debugdump /usr/bin/nvidia-persistenced /usr/bin/nvidia-cuda-mps-control /usr/bin/nvidia-cuda-mps-server; do
+		[ -x "$bin" ] && append_mount "$bin" "$bin" ro
+	done
+{confs}{libs}fi
+"#,
         confs = nvidia_confs(),
         libs = nvidia_libs(),
     )
@@ -661,44 +639,75 @@ fn apt_mirror() -> io::Result<String> {
     ))
 }
 
-fn host_identity_binds() -> &'static str {
-    "\t[ -e /etc/resolv.conf ] && BINDS=\"$BINDS --bind-ro=/etc/resolv.conf:/etc/resolv.conf\"\n\
-     \t[ -e /etc/machine-id ] && BINDS=\"$BINDS --bind-ro=/etc/machine-id:/etc/machine-id\"\n\
-     \t[ -e /etc/localtime ] && BINDS=\"$BINDS --bind-ro=/etc/localtime:/etc/localtime\"\n"
-}
-
 pub fn launcher(target: &str, container_root: &Path, store_base: &Path) -> String {
     let c = shell_escape(&container_root.to_string_lossy());
     let s = shell_escape(&store_base.to_string_lossy());
     let t = shell_escape(target);
+    let crun = crun_bin();
     let nvidia = if has_nvidia() {
         nvidia_block()
     } else {
         String::new()
     };
-    format!(
-        "#!/bin/sh\n\
-         {LAUNCHER_MARKER}\n\
-         CONTAINER=\"{c}\"\n\
-         STORE=\"{s}\"\n\
-         BINDS=\"\"\n\
-         [ -d /tmp/.X11-unix ] && BINDS=\"$BINDS --bind=/tmp/.X11-unix:/tmp/.X11-unix\"\n\
-         if [ -n \"${{XDG_RUNTIME_DIR:-}}\" ]; then\n\
-         \tBINDS=\"$BINDS --bind=${{XDG_RUNTIME_DIR}}:${{XDG_RUNTIME_DIR}}\"\n\
-         fi\n\
-         if [ -n \"${{HOME:-}}\" ]; then\n\
-         \tBINDS=\"$BINDS --bind=${{HOME}}:${{HOME}}\"\n\
-         fi\n\
-         {host_identity}\
-         {nvidia}\
-         {private_users}\
-         exec {nspawn} --quiet $PRIVATE_USERS --directory=\"$CONTAINER\" --bind-ro=\"$STORE:/store\" $BINDS --chdir=/ -- \"{t}\" \"$@\"\n",
-        nspawn = nspawn_bin(),
-        host_identity = host_identity_binds(),
-        private_users = private_users_override_snippet(),
-    )
-}
 
+    let mut script = String::new();
+    script.push_str("#!/bin/sh\n");
+    script.push_str(LAUNCHER_MARKER);
+    script.push('\n');
+    script.push_str(&format!("CONTAINER=\"{}\"\n", c));
+    script.push_str(&format!("STORE=\"{}\"\n", s));
+    script.push_str(&format!("TARGET=\"{}\"\n", t));
+    script.push_str("BUNDLE=\"$(mktemp -d \"${TMPDIR:-/tmp}/univ-crun.XXXXXX\")\"\n");
+    script.push_str("cleanup() {\n  rm -rf \"$BUNDLE\"\n}\n");
+    script.push_str("trap cleanup EXIT HUP INT TERM\n");
+    script.push_str("mkdir -p \"$BUNDLE\"\n");
+    script.push_str("json_escape() {\n  printf '%s' \"$1\" | sed 's/\\\\/\\\\\\\\/g; s/\\\"/\\\\\\\"/g'\n}\n");
+    script.push_str("append_mount() {\n  dest=\"$1\"\n  src=\"$2\"\n  ro=\"$3\"\n  if [ -e \"$src\" ]; then\n    printf '    {\\n' >> \"$BUNDLE/mounts.json\"\n    printf '      \"destination\": \"%s\",\\n' \"$dest\" >> \"$BUNDLE/mounts.json\"\n    printf '      \"type\": \"bind\",\\n' >> \"$BUNDLE/mounts.json\"\n    printf '      \"source\": \"%s\",\\n' \"$(json_escape \"$src\")\" >> \"$BUNDLE/mounts.json\"\n    if [ \"$ro\" = \"ro\" ]; then\n      printf '      \"options\": [\"rbind\", \"ro\"]\\n' >> \"$BUNDLE/mounts.json\"\n    else\n      printf '      \"options\": [\"rbind\"]\\n' >> \"$BUNDLE/mounts.json\"\n    fi\n    printf '    },\\n' >> \"$BUNDLE/mounts.json\"\n  fi\n}\n");
+    script.push_str("touch \"$BUNDLE/mounts.json\"\n");
+    script.push_str("append_mount \"/store\" \"$STORE\" ro\n");
+    script.push_str("[ -d /tmp/.X11-unix ] && append_mount \"/tmp/.X11-unix\" \"/tmp/.X11-unix\" rw\n");
+    script.push_str("if [ -n \"${XDG_RUNTIME_DIR:-}\" ]; then\n  append_mount \"$XDG_RUNTIME_DIR\" \"$XDG_RUNTIME_DIR\" rw\nfi\n");
+    script.push_str("if [ -n \"${HOME:-}\" ]; then\n  append_mount \"$HOME\" \"$HOME\" rw\nfi\n");
+    script.push_str("[ -e /etc/resolv.conf ] && append_mount \"/etc/resolv.conf\" \"/etc/resolv.conf\" ro\n");
+    script.push_str("[ -e /etc/machine-id ] && append_mount \"/etc/machine-id\" \"/etc/machine-id\" ro\n");
+    script.push_str("[ -e /etc/localtime ] && append_mount \"/etc/localtime\" \"/etc/localtime\" ro\n");
+    script.push_str(&nvidia);
+    script.push_str("cat > \"$BUNDLE/entrypoint.sh\" <<'EOF'\n#!/bin/sh\nset -eu\nwhile IFS= read -r arg; do\n  set -- \"$@\" \"$arg\"\ndone < \"$UNIV_ARGV_FILE\"\nexec \"$UNIV_TARGET\" \"$@\"\nEOF\nchmod 755 \"$BUNDLE/entrypoint.sh\"\nprintf '%s\\n' \"$@\" > \"$BUNDLE/argv.txt\"\n");
+    script.push_str("append_mount \"/entrypoint.sh\" \"$BUNDLE/entrypoint.sh\" rw\n");
+    script.push_str("append_mount \"/argv.txt\" \"$BUNDLE/argv.txt\" rw\n");
+    script.push_str("{\n  echo '{'\n  echo '  \"ociVersion\": \"1.0.2\",'\n  echo '  \"process\": {'\n  echo '    \"args\": [\"/bin/sh\", \"/entrypoint.sh\"],'\n  echo '    \"cwd\": \"/\",'\n  echo '    \"env\": ['\n  echo '      \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\",'\n");
+    script.push_str("  echo \"      \\\"UNIV_TARGET=$(json_escape \"$TARGET\")\\\",\"\n");
+    script.push_str("  echo '      \"UNIV_ARGV_FILE=/argv.txt\"'\n");
+    script.push_str("  echo '    ],'\n");
+    script.push_str("  echo '    \"terminal\": false'\n");
+    script.push_str("  echo '  },'\n");
+    script.push_str("  echo '  \"root\": {'\n");
+    script.push_str("  echo \"    \\\"path\\\": \\\"$(json_escape \"$CONTAINER\")\\\",\"\n");
+    script.push_str("  echo '    \"readonly\": false'\n");
+    script.push_str("  echo '  },'\n");
+    script.push_str("  echo '  \"mounts\": ['\n");
+    script.push_str("  if [ -s \"$BUNDLE/mounts.json\" ]; then\n");
+    script.push_str("    sed '$s/,$//' \"$BUNDLE/mounts.json\"\n");
+    script.push_str("  fi\n");
+    script.push_str("  echo '  ],'\n");
+    script.push_str("  echo '  \"linux\": {'\n");
+    script.push_str("  echo '    \"namespaces\": ['\n");
+    script.push_str("  echo '      {\"type\": \"pid\"},'\n");
+    script.push_str("  echo '      {\"type\": \"network\"},'\n");
+    script.push_str("  echo '      {\"type\": \"ipc\"},'\n");
+    script.push_str("  echo '      {\"type\": \"uts\"},'\n");
+    script.push_str("  echo '      {\"type\": \"mount\"},'\n");
+    script.push_str("  echo '      {\"type\": \"user\"}'\n");
+    script.push_str("  echo '    ]'\n");
+    script.push_str("  echo '  }'\n");
+    script.push_str("  echo '}'\n");
+    script.push_str("} > \"$BUNDLE/config.json\"\n");
+    script.push_str(&format!(
+        "exec {crun} --rootless=true run --bundle \"$BUNDLE\" \"univ-{}\"\n",
+        std::process::id()
+    ));
+    script
+}
 #[cfg(test)]
 pub(crate) fn make_package(store: &Store, name: &str, files: &[(&str, &[u8])]) -> StorePath {
     store.add_tree(name, |dir, _ctx| {
@@ -717,7 +726,7 @@ mod tests {
     use super::*;
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("univ-nspawn-{tag}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("univ-crun-{tag}-{}", std::process::id()))
     }
 
     fn with_home(tag: &str, f: impl FnOnce(std::path::PathBuf)) {
@@ -776,6 +785,14 @@ mod tests {
     }
 
     #[test]
+    fn is_univ_launcher_accepts_crun_and_legacy_nspawn_markers() {
+        assert!(is_univ_launcher("# univ crun launcher v2\n"));
+        assert!(is_univ_launcher("# univ nspawn launcher v2\n"));
+        assert!(!is_univ_launcher("user file\n"));
+        assert!(!is_univ_launcher(""));
+    }
+
+    #[test]
     fn rebuild_links_files_into_container_and_resolves_on_host() {
         with_home("rebuild", |home| {
             let store = crate::store::test_store(&home.join(".local/share/univ/store"));
@@ -829,31 +846,62 @@ mod tests {
     }
 
     #[test]
-    fn launcher_script_runs_via_nspawn_with_store_bind() {
+    fn launcher_script_runs_via_crun_with_bundle_and_store_mount() {
         with_home("launcher", |home| {
             let root = root(ContainerKind::Deb).unwrap();
             let store_base = home.join(".local/share/univ/store");
             let script = launcher("/usr/bin/hello", &root, &store_base);
             assert!(script.starts_with("#!/bin/sh"));
             assert!(script.contains(LAUNCHER_MARKER));
-            assert!(script.contains("systemd-nspawn --quiet"));
-            assert!(script.contains("--bind-ro=\"$STORE:/store\""));
-            assert!(script.contains(&format!("STORE=\"{}\"", store_base.display())));
-            assert!(script.contains("-- \"/usr/bin/hello\""));
-            assert!(script.contains("--directory=\"$CONTAINER\""));
+            assert!(script.contains("crun --rootless=true run"));
+            assert!(script.contains("--bundle \"$BUNDLE\""));
+            assert!(script.contains("append_mount \"/store\" \"$STORE\" ro"));
+            assert!(script.contains("UNIV_TARGET=$(json_escape \"$TARGET\")"));
+            assert!(script.contains("UNIV_ARGV_FILE=/argv.txt"));
             assert!(script.contains(&format!("CONTAINER=\"{}\"", root.display())));
+            assert!(script.contains(&format!("TARGET=\"{}\"", "/usr/bin/hello")));
+            assert!(
+                script.contains("echo \"      \\\"UNIV_TARGET=$(json_escape \"$TARGET\")\\\",\"")
+            );
+            assert!(
+                script
+                    .contains("echo \"    \\\"path\\\": \\\"$(json_escape \"$CONTAINER\")\\\",\"")
+            );
+            assert!(script.contains("\"type\": \"user\""));
             assert_eq!(script.contains("/proc/driver/nvidia"), has_nvidia());
-            assert!(script.contains("/etc/resolv.conf:/etc/resolv.conf"));
-            assert!(script.contains("/etc/machine-id:/etc/machine-id"));
-            assert!(script.contains("/etc/localtime:/etc/localtime"));
         });
+    }
+
+    #[test]
+    fn launcher_prefers_univ_crun_and_ignores_univ_nspawn() {
+        let old_crun = std::env::var_os("UNIV_CRUN");
+        let old_nspawn = std::env::var_os("UNIV_NSPAWN");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unsafe { std::env::set_var("UNIV_CRUN", "/custom/crun") };
+            unsafe { std::env::set_var("UNIV_NSPAWN", "systemd-nspawn") };
+            let script = launcher(
+                "/usr/bin/hello",
+                Path::new("/tmp/container"),
+                Path::new("/tmp/store"),
+            );
+            assert!(script.contains("exec /custom/crun --rootless=true run"));
+        }));
+        match old_crun {
+            Some(v) => unsafe { std::env::set_var("UNIV_CRUN", v) },
+            None => unsafe { std::env::remove_var("UNIV_CRUN") },
+        }
+        match old_nspawn {
+            Some(v) => unsafe { std::env::set_var("UNIV_NSPAWN", v) },
+            None => unsafe { std::env::remove_var("UNIV_NSPAWN") },
+        }
+        result.unwrap();
     }
 
     #[test]
     fn nvidia_block_emits_device_driver_and_config_binds() {
         let block = nvidia_block();
         assert!(block.contains("if [ -r /proc/driver/nvidia/version ]; then"));
-        assert!(block.contains("--bind-ro=/proc/driver/nvidia:/proc/driver/nvidia"));
+        assert!(block.contains("append_mount \"/proc/driver/nvidia\" \"/proc/driver/nvidia\" ro"));
         assert!(block.contains("/dev/nvidia*"));
         assert!(block.contains("/dev/dri"));
         assert!(block.contains("nvidia-smi"));
@@ -864,20 +912,13 @@ mod tests {
     #[test]
     fn nvidia_libs_covers_cuda_video_and_optix_and_keeps_arch_classes_separate() {
         let libs = nvidia_libs();
-        // broader glob than plain libnvidia*: cuda/video-decode/optix libs
         assert!(libs.contains("libcuda*.so*"));
         assert!(libs.contains("libnvcuvid*"));
         assert!(libs.contains("libnvoptix*"));
-        // 64-bit sources only ever get bound into 64-bit destinations
-        assert!(libs.contains(
-            "--bind=$lib:/usr/lib/x86_64-linux-gnu/$b --bind=$lib:/usr/lib64/$b"
-        ));
-        // 32-bit sources only ever get bound into 32-bit destinations, never mixed
-        // with the 64-bit loop above
-        assert!(libs.contains(
-            "--bind=$lib:/usr/lib/i386-linux-gnu/$b --bind=$lib:/usr/lib32/$b"
-        ));
-        assert!(!libs.contains("i386-linux-gnu/$b --bind=$lib:/usr/lib64/$b"));
+        assert!(libs.contains("append_mount \"/usr/lib/x86_64-linux-gnu/$b\" \"$lib\" ro"));
+        assert!(libs.contains("append_mount \"/usr/lib64/$b\" \"$lib\" ro"));
+        assert!(libs.contains("append_mount \"/usr/lib/i386-linux-gnu/$b\" \"$lib\" ro"));
+        assert!(libs.contains("append_mount \"/usr/lib32/$b\" \"$lib\" ro"));
     }
 
     #[test]
@@ -889,26 +930,16 @@ mod tests {
         assert!(confs.contains("OpenCL/vendors"));
     }
 
-    // Workaround for systemd/systemd#35387 (rootless nspawn's managed
-    // --private-users varlink allocation can fail/hang on affected systemd
-    // versions). Remove this test along with `private_users_override_snippet`
-    // and its call site in `launcher` once that upstream issue is fixed.
     #[test]
-    fn private_users_override_snippet_reads_env_at_launch_time_not_generation_time() {
-        let snippet = private_users_override_snippet();
-        assert!(snippet.contains("UNIV_NSPAWN_PRIVATE_USERS"));
-        assert!(snippet.contains("--private-users=${UNIV_NSPAWN_PRIVATE_USERS}"));
-    }
-
-    #[test]
-    fn launcher_wires_private_users_override_into_the_nspawn_invocation() {
-        with_home("private-users", |home| {
+    fn launcher_writes_entrypoint_and_argv_files_into_bundle() {
+        with_home("bundle", |home| {
             let root = root(ContainerKind::Deb).unwrap();
             let store_base = home.join(".local/share/univ/store");
             let script = launcher("/usr/bin/hello", &root, &store_base);
-            assert!(script.contains("PRIVATE_USERS=\"\""));
-            assert!(script.contains("UNIV_NSPAWN_PRIVATE_USERS"));
-            assert!(script.contains("--quiet $PRIVATE_USERS --directory="));
+            assert!(script.contains("cat > \"$BUNDLE/entrypoint.sh\""));
+            assert!(script.contains("printf '%s\\n' \"$@\" > \"$BUNDLE/argv.txt\""));
+            assert!(script.contains("append_mount \"/entrypoint.sh\" \"$BUNDLE/entrypoint.sh\" rw"));
+            assert!(script.contains("append_mount \"/argv.txt\" \"$BUNDLE/argv.txt\" rw"));
         });
     }
 
