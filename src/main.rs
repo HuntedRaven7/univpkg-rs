@@ -1,8 +1,8 @@
+mod config;
 mod deb;
 mod elf;
 mod link;
 mod lock;
-mod config;
 mod nspawn;
 mod profile;
 mod repo;
@@ -56,6 +56,7 @@ fn main() -> ExitCode {
                 ensure_bashrc()?;
                 Ok(())
             })();
+            let runtime_result = ensure_crun_runtime();
             match result {
                 Ok(()) => {
                     println!(
@@ -138,9 +139,11 @@ fn main() -> ExitCode {
                     } else {
                         println!("{} {indexed} packages", term::bold_green("indexed"));
                     }
-                    match nspawn::bootstrap() {
+                    match runtime_result {
                         Ok(()) => {}
-                        Err(e) => eprintln!("{}", term::warn(&format!("bootstrap incomplete: {e}"))),
+                        Err(e) => {
+                            eprintln!("{}", term::warn(&format!("bootstrap incomplete: {e}")))
+                        }
                     }
                     for kind in [nspawn::ContainerKind::Deb, nspawn::ContainerKind::Rpm] {
                         let label = if nspawn::bootstrapped(kind) {
@@ -197,7 +200,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        "bootstrap" => match nspawn::bootstrap() {
+        "bootstrap" => match ensure_crun_runtime() {
             Ok(()) => {
                 for kind in [nspawn::ContainerKind::Deb, nspawn::ContainerKind::Rpm] {
                     let label = if nspawn::bootstrapped(kind) {
@@ -269,8 +272,7 @@ fn main() -> ExitCode {
                         })
                     })
                     .collect();
-                let out = serde_json::to_string(&rows)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let out = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
                 println!("{out}");
                 ExitCode::SUCCESS
             } else {
@@ -518,8 +520,7 @@ fn main() -> ExitCode {
                         })
                     })
                     .collect();
-                let out =
-                    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+                let out = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
                 println!("{out}");
                 return ExitCode::SUCCESS;
             }
@@ -568,7 +569,10 @@ fn main() -> ExitCode {
             let pkg = match find_installed(&installed, package) {
                 Some(p) => p,
                 None => {
-                    eprintln!("{}", term::error(&format!("no installed package matching '{package}'")));
+                    eprintln!(
+                        "{}",
+                        term::error(&format!("no installed package matching '{package}'"))
+                    );
                     return ExitCode::FAILURE;
                 }
             };
@@ -628,10 +632,7 @@ fn main() -> ExitCode {
                     ),
                 }
             }
-            println!(
-                "{}",
-                term::bold(&format!("rehashed {relinked} package(s)"))
-            );
+            println!("{}", term::bold(&format!("rehashed {relinked} package(s)")));
             ExitCode::SUCCESS
         }
         "lock" => {
@@ -651,8 +652,7 @@ fn main() -> ExitCode {
                         })
                     })
                     .collect();
-                let out =
-                    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+                let out = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
                 println!("{out}");
             } else if lock.is_empty() {
                 println!("{}", term::dim("no packages locked"));
@@ -797,6 +797,13 @@ fn main() -> ExitCode {
     }
 }
 
+fn ensure_crun_runtime() -> io::Result<()> {
+    nspawn::init(nspawn::ContainerKind::Deb)?;
+    nspawn::init(nspawn::ContainerKind::Rpm)?;
+    nspawn::bootstrap()?;
+    Ok(())
+}
+
 fn run_store() -> ExitCode {
     let dir = std::env::current_exe()
         .ok()
@@ -809,11 +816,12 @@ fn run_store() -> ExitCode {
     };
     match std::process::Command::new(bin).status() {
         Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => {
-            ExitCode::from(status.code().unwrap_or(1) as u8)
-        }
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(e) => {
-            eprintln!("{}", term::error(&format!("failed to launch the store TUI: {e}")));
+            eprintln!(
+                "{}",
+                term::error(&format!("failed to launch the store TUI: {e}"))
+            );
             eprintln!(
                 "{}",
                 term::dim("hint: build it with `cargo build` (produces the `univ-store` binary)")
@@ -823,7 +831,14 @@ fn run_store() -> ExitCode {
     }
 }
 
-fn install_package(arg: &str) -> ExitCode {    let store = match store::Store::open() {
+fn install_package(arg: &str) -> ExitCode {
+    if let Err(e) = ensure_crun_runtime() {
+        eprintln!(
+            "{}",
+            term::warn(&format!("crun runtime setup incomplete: {e}"))
+        );
+    }
+    let store = match store::Store::open() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{}", term::error(&e.to_string()));
@@ -831,9 +846,9 @@ fn install_package(arg: &str) -> ExitCode {    let store = match store::Store::o
         }
     };
     let repo = match repo::repos().and_then(|r| {
-        r.first().cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no repositories configured")
-        })
+        r.first()
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no repositories configured"))
     }) {
         Ok(r) => r,
         Err(e) => {
@@ -888,15 +903,21 @@ fn installed_line(meta: &deb::DebMeta) -> String {
 fn print_help() {
     println!("univ - a content-addressed package manager");
     println!();
-    println!("packages are installed into a systemd-nspawn container (~/.local/univ/container)");
-    println!("and run via nspawn launchers in ~/.local/bin, keeping the host filesystem clean");
+    println!("packages are installed into a crun-backed container root (~/.local/univ/container)");
+    println!("and run via crun launchers in ~/.local/bin, keeping the host filesystem clean");
     println!();
     println!("usage: univ <command> [args]");
     println!();
     println!("commands:");
-    println!("  init                    create the store at ~/.local/univ (with default deb & rpm repos)");
-    println!("  bootstrap               install a base OS into the container (dnf --installroot / debootstrap; needs root)");
-    println!("  apply [file.kdl]        apply a declarative KDL config (default ~/.local/univ/config.kdl)");
+    println!(
+        "  init                    create the store at ~/.local/univ (with default deb & rpm repos)"
+    );
+    println!(
+        "  bootstrap               install a base OS into the container (dnf --installroot / debootstrap; needs root)"
+    );
+    println!(
+        "  apply [file.kdl]        apply a declarative KDL config (default ~/.local/univ/config.kdl)"
+    );
     println!("  store (or --store)      open the interactive store TUI (univ-store)");
     println!("  status                  list installed store paths");
     println!("  list                    list installed packages (add --json for machine-readable)");
@@ -922,7 +943,9 @@ fn print_help() {
     println!("  unlink <package>        remove a package's launchers and desktop entries");
     println!("  uninstall <package>     remove a package's files, launchers and store path");
     println!("                          (plus no-longer-needed dependencies)");
-    println!("  upgrade                 upgrade installed packages to the newest available version");
+    println!(
+        "  upgrade                 upgrade installed packages to the newest available version"
+    );
     println!("                          (downloads only the changed packages)");
     println!("  autoclean               remove orphaned dependency packages");
     println!("  lock                    show the pinned package versions (lock.json)");
@@ -1074,11 +1097,7 @@ fn run_profile(args: &[String]) -> ExitCode {
                         );
                     }
                     if res.removed > 0 {
-                        println!(
-                            "{} {} package(s)",
-                            term::bold_green("removed"),
-                            res.removed
-                        );
+                        println!("{} {} package(s)", term::bold_green("removed"), res.removed);
                     }
                     ExitCode::SUCCESS
                 }
@@ -1162,6 +1181,12 @@ fn report_linked(linked: &link::Linked) {
 }
 
 fn install_deb_file(file: &str) -> ExitCode {
+    if let Err(e) = ensure_crun_runtime() {
+        eprintln!(
+            "{}",
+            term::warn(&format!("crun runtime setup incomplete: {e}"))
+        );
+    }
     let bytes = match std::fs::read(file) {
         Ok(b) => b,
         Err(e) => {
@@ -1205,7 +1230,10 @@ fn install_deb_file(file: &str) -> ExitCode {
             }
             match link::link_package(&s, &p, &meta) {
                 Ok(linked) => report_linked(&linked),
-                Err(e) => eprintln!("{}", term::warn(&format!("warning: integration failed: {e}"))),
+                Err(e) => eprintln!(
+                    "{}",
+                    term::warn(&format!("warning: integration failed: {e}"))
+                ),
             }
             ExitCode::SUCCESS
         }
@@ -1217,6 +1245,12 @@ fn install_deb_file(file: &str) -> ExitCode {
 }
 
 fn install_rpm_file(file: &str) -> ExitCode {
+    if let Err(e) = ensure_crun_runtime() {
+        eprintln!(
+            "{}",
+            term::warn(&format!("crun runtime setup incomplete: {e}"))
+        );
+    }
     let bytes = match std::fs::read(file) {
         Ok(b) => b,
         Err(e) => {
@@ -1254,7 +1288,10 @@ fn install_rpm_file(file: &str) -> ExitCode {
             }
             match link::link_package(&s, &p, &meta) {
                 Ok(linked) => report_linked(&linked),
-                Err(e) => eprintln!("{}", term::warn(&format!("warning: integration failed: {e}"))),
+                Err(e) => eprintln!(
+                    "{}",
+                    term::warn(&format!("warning: integration failed: {e}"))
+                ),
             }
             ExitCode::SUCCESS
         }
@@ -1266,6 +1303,12 @@ fn install_rpm_file(file: &str) -> ExitCode {
 }
 
 fn install_rpm_package(name: &str) -> ExitCode {
+    if let Err(e) = ensure_crun_runtime() {
+        eprintln!(
+            "{}",
+            term::warn(&format!("crun runtime setup incomplete: {e}"))
+        );
+    }
     let store = match store::Store::open() {
         Ok(s) => s,
         Err(e) => {
@@ -1299,7 +1342,10 @@ fn install_rpm_package(name: &str) -> ExitCode {
     }
 }
 
-fn find_installed<'a>(installed: &'a [resolve::Installed], name: &str) -> Option<&'a resolve::Installed> {
+fn find_installed<'a>(
+    installed: &'a [resolve::Installed],
+    name: &str,
+) -> Option<&'a resolve::Installed> {
     let (pkg, arch) = match name.rsplit_once(':') {
         Some((p, a)) => (p, Some(a)),
         None => (name, None),
@@ -1316,15 +1362,18 @@ fn find_installed<'a>(installed: &'a [resolve::Installed], name: &str) -> Option
             }
         })
         .or_else(|| {
-            installed.iter().find(|p| {
-                p.sp.name() == name || p.sp.name().starts_with(&format!("{name}-"))
-            })
+            installed
+                .iter()
+                .find(|p| p.sp.name() == name || p.sp.name().starts_with(&format!("{name}-")))
         })
 }
 
 fn on_path(dir: &std::path::Path) -> bool {
     std::env::var("PATH")
-        .map(|p| p.split(':').any(|d| !d.is_empty() && std::path::Path::new(d) == dir))
+        .map(|p| {
+            p.split(':')
+                .any(|d| !d.is_empty() && std::path::Path::new(d) == dir)
+        })
         .unwrap_or(false)
 }
 

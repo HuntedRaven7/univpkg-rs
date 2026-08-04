@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -54,7 +54,7 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
         if name != meta.package && !apps.contains(&name) {
             continue;
         }
-        
+
         let dest = bin_dir.join(&name);
         let rel = match src.strip_prefix(&store_path) {
             Ok(r) => r.to_path_buf(),
@@ -67,17 +67,19 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
                 linked.bin_links.push(dest.clone());
                 manifest.push(('B', dest, src.clone()));
                 linked_names.insert(name.clone());
-            },
+            }
             Err(e) => eprintln!("univ: warning: not linking {name}: {e}"),
         }
     }
-
 
     let fallback_names: Vec<String> = apps.difference(&linked_names).cloned().collect();
     for name in fallback_names {
         if let Some(path) = find_executable_by_name(&store_path, &name) {
             let dest = bin_dir.join(&name);
-            let rel = path.strip_prefix(&store_path).unwrap_or(&path).to_path_buf();
+            let rel = path
+                .strip_prefix(&store_path)
+                .unwrap_or(&path)
+                .to_path_buf();
             let target = crate::nspawn::container_path_for(&rel);
             if let Err(e) = install_launcher(&dest, &target, kind, store) {
                 eprintln!("univ: warning: not linking fallback {}: {}", name, e);
@@ -93,7 +95,10 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
     if !linked_names.contains(&meta.package) {
         if let Some(path) = find_executable_by_name(&store_path, &meta.package) {
             let dest = bin_dir.join(&meta.package);
-            let rel = path.strip_prefix(&store_path).unwrap_or(&path).to_path_buf();
+            let rel = path
+                .strip_prefix(&store_path)
+                .unwrap_or(&path)
+                .to_path_buf();
             let target = crate::nspawn::container_path_for(&rel);
             if let Err(e) = install_launcher(&dest, &target, kind, store) {
                 eprintln!("univ: warning: not linking {}: {}", meta.package, e);
@@ -122,13 +127,8 @@ pub fn link_package(store: &Store, sp: &StorePath, meta: &DebMeta) -> io::Result
                     continue;
                 }
             };
-            let (rewritten, copies) = rewrite_desktop(
-                &text,
-                &store_path,
-                &icons_dir,
-                &pixmaps_dir,
-                &wrapped,
-            );
+            let (rewritten, copies) =
+                rewrite_desktop(&text, &store_path, &icons_dir, &pixmaps_dir, &wrapped);
             let dest = apps_dir.join(format!("univ-{}-{}", meta.package, file_name));
             match write_desktop(&dest, &rewritten) {
                 Ok(()) => {}
@@ -233,9 +233,11 @@ fn required_by(installed: &[crate::resolve::Installed], name: &str) -> Vec<Strin
     installed
         .iter()
         .filter(|p| {
-            p.meta.depends.iter().flatten().any(|d| {
-                d.package.split(':').next().unwrap_or("") == name
-            })
+            p.meta
+                .depends
+                .iter()
+                .flatten()
+                .any(|d| d.package.split(':').next().unwrap_or("") == name)
         })
         .map(|p| p.meta.package.clone())
         .collect()
@@ -247,8 +249,7 @@ fn remove_orphans(store: &Store) -> Vec<String> {
     loop {
         let installed = crate::resolve::installed_packages(store);
         let orphan = installed.iter().find(|p| {
-            crate::store::is_auto(&p.sp)
-                && required_by(&installed, &p.meta.package).is_empty()
+            crate::store::is_auto(&p.sp) && required_by(&installed, &p.meta.package).is_empty()
         });
         let Some(orphan) = orphan else {
             break;
@@ -310,9 +311,11 @@ pub fn uninstall(package: &str) -> io::Result<(usize, usize, Vec<String>)> {
             .iter()
             .filter(|p| {
                 p.sp != *sp
-                    && p.meta.depends.iter().flatten().any(|d| {
-                        d.package.split(':').next().unwrap_or("") == pkg
-                    })
+                    && p.meta
+                        .depends
+                        .iter()
+                        .flatten()
+                        .any(|d| d.package.split(':').next().unwrap_or("") == pkg)
             })
             .map(|p| p.meta.package.clone())
             .collect();
@@ -379,9 +382,13 @@ fn app_binaries(store_path: &Path) -> HashSet<String> {
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
                 continue;
             }
-            let Ok(text) = fs::read_to_string(&path) else { continue };
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
             for line in text.lines() {
-                let Some((key, value)) = line.split_once('=') else { continue };
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
                 if !matches!(key.trim_end(), "Exec" | "TryExec") {
                     continue;
                 }
@@ -414,11 +421,7 @@ pub fn find_binaries(store_path: &Path) -> io::Result<Vec<PathBuf>> {
             }
         }
     }
-    let fallback_dirs = [
-        "usr/lib",
-        "opt",
-        "usr/share",
-    ];
+    let fallback_dirs = ["usr/lib", "opt", "usr/share"];
     for rel in &fallback_dirs {
         let base = store_path.join(rel);
         if let Ok(entries) = fs::read_dir(&base) {
@@ -459,7 +462,10 @@ fn install_launcher(
             if !existing.contains(crate::nspawn::LAUNCHER_MARKER) {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    format!("{} already exists and is not managed by univ", dest.display()),
+                    format!(
+                        "{} already exists and is not managed by univ",
+                        dest.display()
+                    ),
                 ));
             }
         }
@@ -493,8 +499,7 @@ fn rewrite_desktop(
             match key {
                 "Exec" | "TryExec" => format!("{key}={}", rewrite_exec(value, wrapped)),
                 "Icon" => {
-                    let (value, mut cs) =
-                        rewrite_icon(value, store_path, icons_dir, pixmaps_dir);
+                    let (value, mut cs) = rewrite_icon(value, store_path, icons_dir, pixmaps_dir);
                     copies.append(&mut cs);
                     format!("{key}={value}")
                 }
@@ -549,7 +554,10 @@ fn rewrite_icon(
             let source = store_path.join("usr/share/icons").join(rel);
             if source.is_file() {
                 let dest = icons_dir.join(rel);
-                copies.push(IconCopy { source, dest: dest.clone() });
+                copies.push(IconCopy {
+                    source,
+                    dest: dest.clone(),
+                });
                 return (dest.to_string_lossy().into_owned(), copies);
             }
         }
@@ -557,7 +565,10 @@ fn rewrite_icon(
             let source = store_path.join("usr/share/pixmaps").join(rel);
             if source.is_file() {
                 let dest = pixmaps_dir.join(rel);
-                copies.push(IconCopy { source, dest: dest.clone() });
+                copies.push(IconCopy {
+                    source,
+                    dest: dest.clone(),
+                });
                 return (dest.to_string_lossy().into_owned(), copies);
             }
         }
@@ -643,7 +654,9 @@ fn find_executable_by_name(store_path: &Path, name: &str) -> Option<PathBuf> {
                         for inner_entry in inner.flatten() {
                             let inner_path = inner_entry.path();
                             if inner_path.is_file() {
-                                if let Some(inner_name) = inner_path.file_name().and_then(|n| n.to_str()) {
+                                if let Some(inner_name) =
+                                    inner_path.file_name().and_then(|n| n.to_str())
+                                {
                                     if inner_name == name {
                                         return Some(inner_path);
                                     }
@@ -726,10 +739,8 @@ mod tests {
 
     fn with_env<F: FnOnce(&Store, &Path) -> io::Result<()>>(label: &str, f: F) {
         let _g = crate::store::TEST_HOME_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!(
-            "univ-link-test-{label}-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("univ-link-test-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let home = test_home(&tmp, "home");
@@ -759,12 +770,14 @@ mod tests {
             assert!(launcher.is_file(), "launcher must be a script");
             let script = fs::read_to_string(&launcher).unwrap();
             assert!(
-                script.starts_with("#!/bin/sh")
-                    && script.contains(crate::nspawn::LAUNCHER_MARKER),
+                script.starts_with("#!/bin/sh") && script.contains(crate::nspawn::LAUNCHER_MARKER),
                 "{script}"
             );
-            assert!(script.contains("systemd-nspawn --quiet"));
-            assert!(script.contains("-- \"/usr/bin/foo\""), "{script}");
+            assert!(
+                script.contains("--rootless=true run --bundle \"$BUNDLE\""),
+                "{script}"
+            );
+            assert!(script.contains("TARGET=\"/usr/bin/foo\""), "{script}");
 
             let container = crate::nspawn::root(crate::nspawn::ContainerKind::Deb).unwrap();
             let tree_link = container.join("usr/bin/foo");
@@ -799,13 +812,18 @@ mod tests {
             );
             let icon_dest = home.join(".local/share/icons/hicolor/scalable/apps/foo.svg");
             assert!(icon_dest.is_file());
-            assert!(text.contains(&format!("Icon={}", icon_dest.display())), "{text}");
+            assert!(
+                text.contains(&format!("Icon={}", icon_dest.display())),
+                "{text}"
+            );
 
-            assert!(Store::state_dir()
-                .unwrap()
-                .join(sp.to_string())
-                .join("links")
-                .is_file());
+            assert!(
+                Store::state_dir()
+                    .unwrap()
+                    .join(sp.to_string())
+                    .join("links")
+                    .is_file()
+            );
 
             let removed = unlink("hello").unwrap();
             assert!(removed >= 3, "removed {removed}");
@@ -851,10 +869,12 @@ mod tests {
             assert!(orphans.is_empty());
             assert!(!store_root.exists());
             assert!(!home.join(".local/bin/foo").exists());
-            assert!(!crate::nspawn::root(crate::nspawn::ContainerKind::Deb)
-                .unwrap()
-                .join("usr/bin/foo")
-                .exists());
+            assert!(
+                !crate::nspawn::root(crate::nspawn::ContainerKind::Deb)
+                    .unwrap()
+                    .join("usr/bin/foo")
+                    .exists()
+            );
             assert!(!Store::state_dir().unwrap().join(sp.to_string()).exists());
             Ok(())
         });
@@ -898,7 +918,12 @@ mod tests {
                 ..Default::default()
             };
 
-            for (sp, meta) in [(&sp_app, &meta_app), (&sp_lib, &meta_lib), (&sp_core, &meta_core), (&sp_manual, &meta_manual)] {
+            for (sp, meta) in [
+                (&sp_app, &meta_app),
+                (&sp_lib, &meta_lib),
+                (&sp_core, &meta_core),
+                (&sp_manual, &meta_manual),
+            ] {
                 fs::create_dir_all(store.base().join(sp.to_string())).unwrap();
                 crate::deb::write_meta(meta, sp).unwrap();
             }
